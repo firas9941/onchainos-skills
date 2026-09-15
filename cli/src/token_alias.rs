@@ -161,6 +161,12 @@ static TOKEN_MAP: LazyLock<HashMap<&str, HashMap<&str, &str>>> = LazyLock::new(|
             ("wusdc", "0x5d4b302506645c37ff133b98c4b50a5ae14841659738d6d733d59d0d217a93bf::coin::COIN"),
             ("wusdt", "0xc060006111016b8a020ad5b33834984a437aaa7d3c74c18e09a95d48aceab08c::coin::COIN"),
         ])),
+        // Arc (5042) — native gas asset is USDC itself, not the generic
+        // 0xeeee… EVM placeholder used by ETH/BNB/MATIC-style chains.
+        ("5042", HashMap::from([
+            ("usdc", "0x3600000000000000000000000000000000000000"),
+            ("native", "0x3600000000000000000000000000000000000000"),
+        ])),
     ])
 });
 
@@ -499,5 +505,32 @@ mod tests {
         let err = resolve_and_validate("1", "usdcc", "from-token")
             .expect_err("usdcc rejected (typo)");
         assert!(err.to_string().contains("from-token"));
+    }
+
+    // ── Arc (5042) — explicit stablecoin mapping, not the EVM 0xeeee wildcard ──
+
+    #[test]
+    fn arc_native_and_usdc_aliases_resolve_to_explicit_address() {
+        assert_eq!(
+            resolve_token_address("5042", "usdc"),
+            "0x3600000000000000000000000000000000000000"
+        );
+        assert_eq!(
+            resolve_token_address("5042", "native"),
+            "0x3600000000000000000000000000000000000000"
+        );
+        // Regression guard: must not silently fall back to the generic EVM
+        // native placeholder just because "5042" isn't specially handled.
+        assert_ne!(
+            resolve_token_address("5042", "native"),
+            "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        );
+    }
+
+    #[test]
+    fn resolve_and_validate_arc_usdc_alias_returns_ca() {
+        let resolved = resolve_and_validate("5042", "usdc", "from-token")
+            .expect("usdc alias resolves on Arc");
+        assert_eq!(resolved, "0x3600000000000000000000000000000000000000");
     }
 }

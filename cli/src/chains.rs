@@ -311,6 +311,7 @@ pub fn chain_display_name(chain_index: &str) -> &str {
         "42161" => "Arbitrum One",
         "43114" => "Avalanche",
         "59144" => "Linea",
+        "5042" => "Arc",
         _ => chain_index,
     }
 }
@@ -330,11 +331,16 @@ pub fn native_token_symbol(chain_index: &str) -> &str {
         "501" => "SOL",
         "607" => "TON",
         "784" => "SUI",
+        "5042" => "USDC",
         _ => "native token",
     }
 }
 
 /// Native token address for a given chainIndex.
+///
+/// Arc (5042) is explicit rather than falling into the generic EVM wildcard:
+/// its native gas asset is a stablecoin at a fixed contract address, not the
+/// conventional `0xeeee…` placeholder used by ETH/BNB/MATIC-style chains.
 pub fn native_token_address(chain_index: &str) -> &str {
     match chain_index {
         "0" | "5" => "",
@@ -342,6 +348,7 @@ pub fn native_token_address(chain_index: &str) -> &str {
         "784" => "0x2::sui::SUI",
         "195" => "T9yD14Nj9j7xAB4dbGeiX9h8unkKHxuWwb",
         "607" => "EQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAM9c",
+        "5042" => "0x3600000000000000000000000000000000000000",
         // EVM chains (Ethereum, BSC, Polygon, Arbitrum, Base, etc.)
         _ => "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
     }
@@ -519,6 +526,24 @@ mod tests {
     fn xlayer_testnet_display_and_symbol_resolved() {
         assert_eq!(chain_display_name("1952"), "X Layer Testnet");
         assert_eq!(native_token_symbol("1952"), "OKB");
+    }
+
+    #[test]
+    fn arc_chain_5042_has_explicit_native_mapping() {
+        // Regression guard: Arc's native gas asset is a stablecoin at a fixed
+        // contract address — it must never fall into the generic EVM `0xeeee…`
+        // wildcard just because "5042" isn't one of the other special-cased
+        // non-EVM chains.
+        assert_eq!(chain_display_name("5042"), "Arc");
+        assert_eq!(native_token_symbol("5042"), "USDC");
+        assert_eq!(
+            native_token_address("5042"),
+            "0x3600000000000000000000000000000000000000"
+        );
+        assert_ne!(
+            native_token_address("5042"),
+            "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        );
     }
 
     #[test]
