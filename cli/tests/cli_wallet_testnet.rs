@@ -48,9 +48,7 @@
 //!   `cli/target/test_tmp/cli_wallet_testnet/` (the agent sandbox denies
 //!   writes to `/var/folders/.../T/` so `tempfile::tempdir()` is unsafe
 //!   here).
-//! - All `OKX_*` env vars and `OKX_BASE_URL` are scrubbed from the inherited
-//!   environment so the binary cannot silently fall through to host
-//!   credentials.
+//! - Authentication state is isolated through `ONCHAINOS_HOME`.
 
 mod common;
 
@@ -98,12 +96,7 @@ fn fresh_home() -> (TestHome, PathBuf) {
 /// Strip any `OKX_*` / `ONCHAINOS_HOME` env vars inherited from the host so
 /// each test sees a pristine environment, then re-set only `ONCHAINOS_HOME`.
 fn scrubbed<'a>(cmd: &'a mut assert_cmd::Command, home: &Path) -> &'a mut assert_cmd::Command {
-    cmd.env_remove("OKX_API_KEY")
-        .env_remove("OKX_ACCESS_KEY")
-        .env_remove("OKX_SECRET_KEY")
-        .env_remove("OKX_PASSPHRASE")
-        .env_remove("OKX_BASE_URL")
-        .env("ONCHAINOS_HOME", home)
+    cmd.env("ONCHAINOS_HOME", home)
 }
 
 /// Convenience: assert the chain-recognition signal is GREEN — neither

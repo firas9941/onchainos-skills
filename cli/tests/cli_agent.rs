@@ -278,6 +278,37 @@ fn my_tasks_help_documents_defaults_and_filters() {
 }
 
 #[test]
+fn get_my_agents_help_documents_agent_ids_filter() {
+    let output = onchainos()
+        .args(["agent", "get-my-agents", "--help"])
+        .output()
+        .expect("run get-my-agents help");
+
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("--agent-ids <AGENT_IDS>"),
+        "help missing --agent-ids: {stdout}"
+    );
+
+    let parsed = onchainos()
+        .args([
+            "agent",
+            "get-my-agents",
+            "--role",
+            "user",
+            "--agent-ids",
+            "13373,9967",
+            "--page",
+            "1",
+            "--help",
+        ])
+        .output()
+        .expect("parse representative get-my-agents arguments");
+    assert_eq!(parsed.status.code(), Some(0));
+}
+
+#[test]
 fn my_tasks_rejects_invalid_ranges() {
     for args in [
         ["agent", "my-tasks", "--status-type", "3"],

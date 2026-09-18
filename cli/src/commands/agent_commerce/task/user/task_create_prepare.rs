@@ -74,14 +74,11 @@ fn a2mcp_service_routing_decision(service_snapshot: Value) -> Value {
 struct DuplicateSubscriptionContext {
     job_id: String,
     title: String,
-    status: i64,
-    status_label: String,
-    status_description: String,
-    active: bool,
+    restore_listening_available: bool,
 }
 
 fn duplicate_next_actions(existing: &DuplicateSubscriptionContext) -> Value {
-    if existing.active {
+    if existing.restore_listening_available {
         json!([
             {"id": "restore_subscription", "recommend": true},
             {"id": "stop", "recommend": false}
@@ -95,10 +92,7 @@ fn duplicate_payload(existing: &DuplicateSubscriptionContext) -> Value {
     json!({
         "jobId": existing.job_id,
         "title": existing.title,
-        "status": existing.status,
-        "statusLabel": existing.status_label,
-        "statusDescription": existing.status_description,
-        "active": existing.active,
+        "restoreListeningAvailable": existing.restore_listening_available,
     })
 }
 
@@ -132,10 +126,7 @@ fn duplicate_subscription_context(
     Ok(DuplicateSubscriptionContext {
         job_id: job_id.to_string(),
         title: title.to_string(),
-        status: existing.status,
-        status_label: existing.status_label.clone(),
-        status_description: existing.status_description.clone(),
-        active: existing.restore_listening_available,
+        restore_listening_available: existing.restore_listening_available,
     })
 }
 
@@ -434,7 +425,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_payload_uses_authoritative_buyer_subscription() {
+    fn duplicate_payload_excludes_lifecycle_status_facts() {
         let summary = super::super::subscription_ops::ExistingSubscriptionSummary {
             job_id: "job-42".to_string(),
             service_id: "svc-42".to_string(),
@@ -453,10 +444,7 @@ mod tests {
             json!({
                 "jobId": "job-42",
                 "title": "Signal Subscription",
-                "status": 1,
-                "statusLabel": "Active",
-                "statusDescription": "The subscription is active.",
-                "active": true
+                "restoreListeningAvailable": true
             })
         );
         assert_eq!(
@@ -485,8 +473,8 @@ mod tests {
         };
         let existing = duplicate_subscription_context(&summary).expect("valid duplicate metadata");
 
-        assert_eq!(existing.status, 3);
         assert_eq!(existing.title, "Paused Signals");
+        assert!(!existing.restore_listening_available);
         assert_eq!(duplicate_next_actions(&existing), next_action("stop", true));
     }
 

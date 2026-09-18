@@ -89,7 +89,7 @@ pub(crate) async fn resolve_token_symbol_by_address(
     chain_index: &str,
     contract_address: &str,
 ) -> Result<String> {
-    let mut client = crate::client::ApiClient::new(None)?;
+    let mut client = crate::client::ApiClient::new()?;
     let resp =
         crate::commands::token::fetch_info(&mut client, contract_address, chain_index).await?;
     let sym = resp

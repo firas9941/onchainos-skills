@@ -444,7 +444,7 @@ pub fn cli_command_name(cmd: &crate::Commands) -> String {
         Commands::Swap { command } => format!("swap {}", swap_sub(command)),
         Commands::Gateway { command } => format!("gateway {}", gateway_sub(command)),
         Commands::Portfolio { command } => format!("portfolio {}", portfolio_sub(command)),
-        Commands::Mcp { .. } => "mcp".to_string(),
+        Commands::Mcp => "mcp".to_string(),
         Commands::Wallet { command } => format!("wallet {}", wallet_sub(command)),
         Commands::Security { command } => format!("security {}", security_sub(command)),
         Commands::Leaderboard { command } => format!("leaderboard {}", leaderboard_sub(command)),

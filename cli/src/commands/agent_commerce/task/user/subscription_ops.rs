@@ -347,7 +347,6 @@ pub async fn handle_subscribe_detail(
     }
 
     let title = resp["title"].as_str().unwrap_or("?");
-    let status = resp["status"].as_i64().unwrap_or(-1);
     let trial_type = resp["trialType"].as_i64().unwrap_or(0);
     let auto_renew = resp["autoRenew"].as_i64().unwrap_or(0);
     let period_index = resp["periodIndex"].as_u64().unwrap_or(0);
@@ -357,17 +356,9 @@ pub async fn handle_subscribe_detail(
     let sub_start = resp["subStartTime"].as_i64();
     let sub_end = resp["subEndTime"].as_i64();
 
-    let sub_status = SubStatus::from_code(status);
-    let status_label = if sub_status == SubStatus::Active && trial_type == 1 {
-        "Active (Trial)"
-    } else {
-        status_label(status)
-    };
-
     println!("Subscription Detail: {title}");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("  subId:     {}", resp["jobId"].as_str().unwrap_or(sub_id));
-    println!("  status:    {status_label}");
     println!("  buyer:     #{buyer}");
     println!("  provider:  #{provider}");
     println!("  fee:       {amount}/month");

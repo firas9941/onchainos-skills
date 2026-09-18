@@ -11,7 +11,6 @@ const repoRoot = path.resolve(scriptDir, "../..");
 const codexDir = path.join(repoRoot, ".codex");
 const binDir = path.join(codexDir, "bin");
 const projectSkillsDir = path.join(repoRoot, ".agents", "skills");
-const devConfig = path.join(codexDir, "dev.json");
 const codexConfig = path.join(codexDir, "config.toml");
 const sourceSkillsDir = path.join(repoRoot, "skills");
 const generatedSkillPrefix = "# onchainos-dev generated skill conflict";
@@ -28,21 +27,6 @@ function ensureDir(dir, mode = 0o700) {
 
 function chmodPrivate(file) {
   try { fs.chmodSync(file, 0o600); } catch {}
-}
-
-function readEnvironment() {
-  let value;
-  try { value = JSON.parse(fs.readFileSync(devConfig, "utf8")); }
-  catch (error) { fail(`invalid ${devConfig}: ${error.message}`); }
-  const keys = Object.keys(value);
-  if (keys.length !== 1 || keys[0] !== "environment" || typeof value.environment !== "string" || !value.environment.trim()) {
-    fail(`${devConfig} must contain exactly one non-empty string field: environment`);
-  }
-  const selected = value.environment.trim();
-  if (selected === "beta") return { selected, label: "beta", baseUrl: "https://beta.okex.org" };
-  if (selected === "production") return { selected, label: "production", baseUrl: "https://web3.okx.com" };
-  if (/^https?:\/\//.test(selected)) return { selected, label: "custom", baseUrl: selected };
-  fail(`unsupported environment '${selected}' (use beta, production, or an http(s) URL)`, 2);
 }
 
 function parseSkillName(skillMd) {
@@ -181,6 +165,18 @@ function linkFile(source, target) {
   fs.symlinkSync(source, target);
 }
 
+function ensureLinuxCliLink() {
+  if (process.platform !== "linux") return;
+  const userLink = path.join(os.homedir(), ".local", "bin", "onchainos");
+  const projectWrapper = path.join(binDir, "onchainos");
+  const existing = fs.lstatSync(userLink, { throwIfNoEntry: false });
+  if (existing?.isDirectory() && !existing.isSymbolicLink()) fail(`cannot replace directory ${userLink} with Linux development CLI link`);
+  if (existing) fs.unlinkSync(userLink);
+  fs.mkdirSync(path.dirname(userLink), { recursive: true, mode: 0o755 });
+  fs.symlinkSync(projectWrapper, userLink);
+  console.log(`Linux CLI: ${userLink} -> ${projectWrapper}`);
+}
+
 function dedupePath(entries) {
   return [...new Set(entries.filter(Boolean).map((entry) => path.resolve(entry)))];
 }
@@ -230,42 +226,31 @@ function init() {
   ensureDir(codexDir);
   ensureDir(binDir);
   for (const dir of ["build/cargo-home", "build/cargo-target", "runtime/onchainos", "runtime/a2a", "runtime/a2a-spool", "runtime/tmp"]) ensureDir(path.join(codexDir, dir));
-  if (!fs.existsSync(devConfig)) fs.copyFileSync(path.join(repoRoot, "config", "onchainos-dev.example.json"), devConfig);
-  chmodPrivate(devConfig);
-  readEnvironment();
 
   const a2a = findExecutableOutsideProject("okx-a2a");
   if (!a2a) fail("global okx-a2a is required but was not found on PATH");
   linkFile(path.join(scriptDir, "onchainos.sh"), path.join(binDir, "onchainos"));
   linkFile(path.join(scriptDir, "okx-a2a.sh"), path.join(binDir, "okx-a2a"));
   linkFile(a2a, path.join(binDir, "okx-a2a.real"));
+  ensureLinuxCliLink();
   updateCodexPath();
   const skills = refreshSkills();
 
   console.log("Initialized project-local OnchainOS development.");
-  console.log(`  Config: ${devConfig}`);
   console.log(`  CLI:    ${path.join(binDir, "onchainos")}`);
   console.log(`  A2A:    ${path.join(binDir, "okx-a2a")} -> ${a2a}`);
   console.log(`  Skills: linked=${skills.linked.length} global-conflicts-disabled=${skills.conflicts.length}`);
   console.log("Reload Codex and start a new task before validating Skill routing.");
 }
 
-function envCommand(value) {
-  if (value) {
-    const selected = value.trim();
-    if (!(selected === "beta" || selected === "production" || /^https?:\/\//.test(selected))) fail("environment must be beta, production, or an http(s) URL", 2);
-    ensureDir(codexDir);
-    fs.writeFileSync(devConfig, `${JSON.stringify({ environment: selected }, null, 2)}\n`, { mode: 0o600 });
-    chmodPrivate(devConfig);
-  }
-  const env = readEnvironment();
-  console.log(`Environment: ${env.label}`);
-  console.log(`Base URL:    ${env.baseUrl}`);
+function build() {
+  const result = spawnSync("bash", [path.join(scriptDir, "build-onchainos.sh")], { cwd: repoRoot, stdio: "inherit" });
+  if (result.error) fail(`failed to start CLI build: ${result.error.message}`);
+  if (result.status !== 0) process.exit(result.status ?? 1);
 }
 
 function doctor() {
   const errors = [];
-  const env = readEnvironment();
   const expected = { onchainos: path.join(binDir, "onchainos"), "okx-a2a": path.join(binDir, "okx-a2a") };
   for (const [name, target] of Object.entries(expected)) {
     try { if (!(fs.statSync(target).mode & 0o111)) errors.push(`${name} wrapper is not executable`); }
@@ -282,8 +267,6 @@ function doctor() {
     if (!sameFile(local, skill.dir)) errors.push(`skill '${skill.name}' is not linked from the current project`);
   }
 
-  console.log(`Environment: ${env.label}`);
-  console.log(`Base URL:    ${env.baseUrl}`);
   console.log(`CLI state:   ${path.join(codexDir, "runtime", "onchainos")}`);
   console.log(`A2A state:   ${path.join(codexDir, "runtime", "a2a")}`);
   if (errors.length) {
@@ -296,7 +279,7 @@ function doctor() {
 
 function runA2a(args, quiet = false) {
   const wrapper = path.join(binDir, "okx-a2a");
-  if (!fs.existsSync(wrapper)) { if (!quiet) fail("A2A wrapper is missing; run npm run dev:init"); return; }
+  if (!fs.existsSync(wrapper)) { if (!quiet) fail("A2A wrapper is missing; run npm run setup"); return; }
   return spawnSync(wrapper, args, { cwd: repoRoot, stdio: quiet ? "ignore" : "inherit" });
 }
 
@@ -316,35 +299,40 @@ function removeOwnedProjectSkills() {
   }
 }
 
-function clean(all, removeConfig) {
+function removeLinuxCliLink() {
+  if (process.platform !== "linux") return;
+  const userLink = path.join(os.homedir(), ".local", "bin", "onchainos");
+  const projectWrapper = path.join(binDir, "onchainos");
+  try {
+    if (!fs.lstatSync(userLink).isSymbolicLink()) return;
+    const target = path.resolve(path.dirname(userLink), fs.readlinkSync(userLink));
+    if (target !== projectWrapper) return;
+    fs.unlinkSync(userLink);
+    console.log(`Removed Linux development CLI link: ${userLink}`);
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+}
+
+function clean() {
   stop();
   removeOwnedProjectSkills();
+  removeLinuxCliLink();
   for (const relative of ["bin", "build", "runtime/a2a-spool", "runtime/tmp"]) fs.rmSync(path.join(codexDir, relative), { recursive: true, force: true });
-  if (all) {
-    fs.rmSync(path.join(codexDir, "runtime", "onchainos"), { recursive: true, force: true });
-    fs.rmSync(path.join(codexDir, "runtime", "a2a"), { recursive: true, force: true });
-  }
-  if (removeConfig) {
-    fs.rmSync(devConfig, { force: true });
-    fs.rmSync(codexConfig, { force: true });
-  }
-  console.log(`Cleaned project-local development${all ? " including credentials and A2A identity" : "; credentials and A2A identity were preserved"}.`);
+  fs.rmSync(path.join(codexDir, "runtime", "onchainos"), { recursive: true, force: true });
+  fs.rmSync(path.join(codexDir, "runtime", "a2a"), { recursive: true, force: true });
+  fs.rmSync(codexConfig, { force: true });
+  console.log("Cleaned project-local development including credentials, A2A identity, and Codex configuration.");
 }
 
 const [command = "help", ...args] = process.argv.slice(2);
 switch (command) {
   case "init": init(); break;
-  case "skills": {
-    const result = refreshSkills();
-    console.log(`Skills refreshed: linked=${result.linked.length} global-conflicts-disabled=${result.conflicts.length}`);
-    console.log("Reload Codex/start a new task after changing Skill metadata or membership.");
-    break;
-  }
-  case "env": envCommand(args[0]); break;
+  case "build": build(); break;
   case "doctor": doctor(); break;
   case "stop": stop(); break;
-  case "clean": clean(args.includes("--all"), args.includes("--config")); break;
+  case "clean": clean(); break;
   default:
-    console.log("Usage: dev.mjs <init|skills|env [name-or-url]|doctor|stop|clean [--all] [--config]>");
+    console.log("Usage: dev.mjs <init|build|doctor|stop|clean>");
     process.exit(command === "help" ? 0 : 2);
 }

@@ -7,8 +7,6 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AppConfig {
     #[serde(default)]
-    pub base_url: String,
-    #[serde(default)]
     pub api_key: String,
     #[serde(default)]
     pub session_token: String,

@@ -629,9 +629,9 @@ fn apply_trade_kit_auth_environment(
     auth_mode: Option<consent::TradeKitAuthMode>,
 ) {
     if auth_mode == Some(consent::TradeKitAuthMode::OAuth) {
-        // The OKX CLI prefers API-key credentials over a valid OAuth session
-        // and falls back to API-key values in its config when these variables
-        // are absent. Empty overrides mask both inherited and config-file AKs.
+        // The separately spawned OKX trading CLI prefers API-key credentials
+        // over a valid OAuth session and falls back to API-key values in its own
+        // config when these variables are absent. Empty overrides mask both.
         command.env("OKX_API_KEY", "")
             .env("OKX_SECRET_KEY", "")
             .env("OKX_PASSPHRASE", "");
@@ -1650,26 +1650,23 @@ pub fn claim_direct(
     })
 }
 
-async fn hydrate_guide_direct_contract(
+pub(crate) async fn restore_subscription_local_contract(
     job_id: &str,
-    context: &consent::DeliveryContext,
-) -> Result<()> {
-    use crate::commands::agent_commerce::task::common::network::task_api_client::TaskApiClient;
-
-    let mut client = TaskApiClient::new();
-    let active = subscription::determine_active_delivery(&mut client, job_id, &context.agent_id)
-        .await
-        .map_err(|_| anyhow::anyhow!("subscription is no longer Active"))?;
-    if active.provider_agent_id != context.provider_agent_id {
-        bail!("Active subscription no longer matches this delivery")
-    }
+    agent_id: &str,
+    provider_agent_id: &str,
+    service_id: &str,
+    service_hint: Option<&Value>,
+) -> Result<Option<subscription_config::ExecutionMode>> {
     if !guide::guide_path(job_id)?.is_file() {
-        let service = crate::commands::agent_commerce::task::common::find_service(
-            &context.provider_agent_id,
-            &active.service_id,
-        )
-        .await?
-        .context("service is not available to restore its Guide")?;
+        let service = match service_hint {
+            Some(service) => service.clone(),
+            None => crate::commands::agent_commerce::task::common::find_service(
+                provider_agent_id,
+                service_id,
+            )
+            .await?
+            .context("service is not available to restore its Guide")?,
+        };
         let source = service
             .get("serviceGuide")
             .and_then(Value::as_str)
@@ -1679,10 +1676,42 @@ async fn hydrate_guide_direct_contract(
             .context("service has no Guide to restore")?;
         let file = draft
             .clone()
-            .into_file(job_id, &active.service_id, Some(&context.provider_agent_id));
+            .into_file(job_id, service_id, Some(provider_agent_id));
         guide::write_guide(&file, &draft.source)?;
     }
-    guide::migrate_legacy_json_consent_if_needed(job_id, &context.agent_id, &active.service_id)?;
+    guide::migrate_legacy_json_consent_if_needed(job_id, agent_id, service_id)?;
+    subscription_config::execution_mode(agent_id, service_id)
+}
+
+async fn hydrate_subscription_contract(
+    job_id: &str,
+    context: &consent::DeliveryContext,
+) -> Result<subscription::ActiveSubscription> {
+    use crate::commands::agent_commerce::task::common::network::task_api_client::TaskApiClient;
+
+    let mut client = TaskApiClient::new();
+    let active = subscription::determine_active_delivery(&mut client, job_id, &context.agent_id)
+        .await
+        .map_err(|_| anyhow::anyhow!("subscription is no longer Active"))?;
+    if active.provider_agent_id != context.provider_agent_id {
+        bail!("Active subscription no longer matches this delivery")
+    }
+    restore_subscription_local_contract(
+        job_id,
+        &context.agent_id,
+        &context.provider_agent_id,
+        &active.service_id,
+        None,
+    )
+    .await?;
+    Ok(active)
+}
+
+async fn require_guide_direct_subscription(
+    job_id: &str,
+    context: &consent::DeliveryContext,
+) -> Result<()> {
+    let active = hydrate_subscription_contract(job_id, context).await?;
     if subscription_config::execution_mode(&context.agent_id, &active.service_id)?
         != Some(subscription_config::ExecutionMode::GuideDirect)
     {
@@ -1708,7 +1737,7 @@ pub async fn prepare_guide_direct(
     if !std::path::Path::new(&context.saved_path).is_file() {
         bail!("saved subscription Signal is not available")
     }
-    let reason = match hydrate_guide_direct_contract(job_id, &context).await {
+    let reason = match require_guide_direct_subscription(job_id, &context).await {
         Ok(()) if guide::has_active_execution_contract(job_id) => None,
         Ok(()) => Some("active local Service Guide and Guide Consent are required".to_string()),
         Err(error) => Some(error.to_string()),
@@ -1744,7 +1773,7 @@ pub async fn claim_guide_direct(
     if !std::path::Path::new(&context.saved_path).is_file() {
         bail!("saved subscription Signal is not available")
     }
-    hydrate_guide_direct_contract(job_id, &context).await?;
+    require_guide_direct_subscription(job_id, &context).await?;
     if !guide::has_active_execution_contract(job_id) {
         bail!("active local Service Guide and Guide Consent are required")
     }

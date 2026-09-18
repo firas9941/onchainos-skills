@@ -1051,7 +1051,7 @@ mod tests {
         std::env::set_var("ONCHAINOS_HOME", &test_home);
 
         let production = "https://web3.okx.com";
-        let beta = "https://beta.okex.org";
+        let alternate = "https://example.invalid";
         // 5.0.89 used an environment-agnostic hash and a plain-text marker.
         // Leave such a file in place and prove V2 never consumes it.
         let mut legacy_hasher = Sha256::new();
@@ -1063,13 +1063,13 @@ mod tests {
             .join(format!("{:x}.pending", legacy_hasher.finalize()));
         crate::home::atomic_write(&legacy_path, b"pending\n", true).unwrap();
         assert!(!new_device_routing_is_pending(production, "agent-1", "device-1").unwrap());
-        assert!(!new_device_routing_is_pending(beta, "agent-1", "device-1").unwrap());
+        assert!(!new_device_routing_is_pending(alternate, "agent-1", "device-1").unwrap());
         mark_new_device_routing_pending(production, "agent-1", "device-1").unwrap();
         assert!(new_device_routing_is_pending(production, "agent-1", "device-1").unwrap());
         assert!(
             new_device_routing_is_pending("https://web3.okx.com/", "agent-1", "device-1").unwrap()
         );
-        assert!(!new_device_routing_is_pending(beta, "agent-1", "device-1").unwrap());
+        assert!(!new_device_routing_is_pending(alternate, "agent-1", "device-1").unwrap());
         assert!(!new_device_routing_is_pending(production, "agent-1", "device-2").unwrap());
 
         mark_new_device_routing_completed(production, "agent-1", "device-1").unwrap();

@@ -17,13 +17,9 @@ pub(super) const SERVICE_GUIDE_MAX_DISPLAY_WIDTH: usize = 10_000;
 
 // ─── HTTP client ──────────────────────────────────────────────────────────
 
-/// Build the wallet HTTP client honoring `--base-url`. Forwards
-/// `ctx.base_url_override` to `WalletApiClient::with_base_url` so the
-/// override is actually applied (precedence inside `with_base_url`:
-/// runtime `OKX_BASE_URL` > compile-time `OKX_BASE_URL` > override >
-/// `DEFAULT_BASE_URL`).
-pub(super) fn wallet_client(ctx: &Context) -> Result<WalletApiClient> {
-    WalletApiClient::with_base_url(ctx.base_url_override.as_deref())
+/// Build the wallet HTTP client against the effective process endpoint.
+pub(super) fn wallet_client(_ctx: &Context) -> Result<WalletApiClient> {
+    WalletApiClient::new()
 }
 
 // ─── Logging helpers ──────────────────────────────────────────────────────
@@ -37,56 +33,17 @@ pub(super) fn redact_token_for_debug(token: &str) -> String {
     format!("{}***{}", head, tail)
 }
 
-// Log-only helpers. Precedence mirrors WalletApiClient::with_base_url:
-// compile-time OKX_BASE_URL > ctx.base_url_override > DEFAULT_BASE_URL.
+// Log-only helpers use the same effective endpoint as WalletApiClient.
 // Note: reconstruct_get_url_for_log does NOT percent-encode values, so the
 // logged URL may diverge from the actual wire URL when values contain
 // characters that wallet_api::build_query_string would escape.
-fn resolve_base_url_for_log(ctx: &Context) -> String {
-    option_env!("OKX_BASE_URL")
-        .map(str::to_string)
-        .or_else(|| ctx.base_url_override.clone())
-        .unwrap_or_else(|| crate::client::DEFAULT_BASE_URL.to_string())
+fn resolve_base_url_for_log(_ctx: &Context) -> &'static str {
+    crate::endpoints::base_url()
 }
 
-/// Production WS endpoint for the `wallet-agentic-identity` push channel.
-/// Mirrors the `WS_URL_PROD` / `WS_URL_PRE` + `ONCHAINOS_WS_URL` env-
-/// override pattern in `cli/src/watch/daemon.rs:18-19,134` (same WS
-/// gateway host, different per-service path: `/ws/v5/private` here vs
-/// `/ws/v6/dex` for the watch dex feed). Identity keeps its own
-/// constant rather than importing from `watch/` so identity-side
-/// changes never risk regressing the watch daemon's contract.
-const WS_URL_PROD: &str = "wss://wsdex.okx.com:8443/ws/v5/private";
-
-/// Resolve the full WS URL for the `wallet-agentic-identity` push
-/// channel. Precedence:
-///   1. runtime `OKX_AGENTIC_WS_URL` — explicit override, full URL
-///      including `/ws/v5/private` path (escape hatch for forked /
-///      pre / debug envs; production leaves it unset).
-///   2. `WS_URL_PROD` constant — production default.
-///
-/// Identity does not derive this URL from the HTTP base — the WS push
-/// service runs on a separate host (`wsdex.okx.com`) from the HTTP API
-/// (`web3.okx.com`), so scheme swap on the HTTP base would land WS on
-/// the wrong host.
-///
-/// **Breaking change vs. earlier revisions**: prior to this refactor the
-/// WS URL was derived from `--base-url` / runtime `OKX_BASE_URL` /
-/// compile-time `OKX_BASE_URL` via scheme swap (`http→ws`, `https→wss`)
-/// with `/ws/v5/private` appended. **That coupling is gone.** Setting
-/// `--base-url` (or either `OKX_BASE_URL` flavor) now only affects HTTP
-/// calls; the WS subscription always uses `WS_URL_PROD` unless
-/// `OKX_AGENTIC_WS_URL` is also set. The failure mode is **silent
-/// degradation**, not an error: if you point HTTP at a pre / forked env
-/// without also pointing `OKX_AGENTIC_WS_URL` at the matching WS host,
-/// `agent create` / `agent update` will still succeed (broadcast +
-/// agentList come from HTTP), but the `agent` field in the response
-/// envelope will be absent because the WS push never lands on the right
-/// host. Migration: when switching HTTP targets, also set
-/// `OKX_AGENTIC_WS_URL` to the corresponding WS endpoint.
-pub(super) fn identity_ws_url() -> String {
-    std::env::var("OKX_AGENTIC_WS_URL")
-        .unwrap_or_else(|_| WS_URL_PROD.to_string())
+/// Compile-time `wallet-agentic-identity` push endpoint.
+pub(super) fn identity_ws_url() -> &'static str {
+    crate::endpoints::AGENT_IDENTITY_WS_URL
 }
 
 pub(super) fn reconstruct_post_url_for_log(ctx: &Context, path: &str) -> String {
@@ -742,9 +699,11 @@ fn role_is_asp(role: Option<&Value>) -> bool {
 }
 
 /// Apply `f` to every agent-row object in an `agent get` (`/agent-list`)
-/// envelope, tolerating BOTH shapes the backend has used:
-///   • single-layer  `list[*]`              — the live `/agent-list` today
-///   • double-layer   `list[*].agentList[*]` — the older grouped doc schema
+/// envelope, tolerating BOTH shapes:
+///   • double-layer  `list[*].agentList[*]` — the live `/agent-list` today,
+///     grouped by owning account (`list[*].accountName`/`ownerAddress`)
+///   • single-layer  `list[*]`              — defensive fallback; not
+///     observed on the live endpoint, kept in case a caller omits grouping
 /// A `list[*]` element is treated as a wrapper iff it carries an `agentList`
 /// array; otherwise the element IS the agent row. No-op when `list` is absent.
 fn for_each_agent_row(v: &mut Value, mut f: impl FnMut(&mut Value)) {
@@ -827,8 +786,8 @@ fn format_rating_stars(score: u64) -> String {
 }
 
 /// Enrich a `agent get` response in place: for every agent row — read from
-/// the single-layer shape (`list[*]`) or the legacy double-layer shape
-/// (`list[*].agentList[*]`), both tolerated by `for_each_agent_row` — ADD the
+/// the live double-layer shape (`list[*].agentList[*]`) or the single-layer
+/// fallback (`list[*]`), both tolerated by `for_each_agent_row` — ADD the
 /// computed `roleLabel` / `statusLabel` / `approvalLabel` / `ratingStars`
 /// fields. Raw fields are never removed or altered. Each field is added only
 /// when its source maps to a known value.

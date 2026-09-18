@@ -25,34 +25,27 @@ pub(super) async fn run_probe(args: &ProbeArgs) -> Result<ProbeDecision> {
     if let Some(required) = outstanding_request_input(&input) {
         return Ok(input_required_decision(input, required));
     }
-    let mut outcome = match send_probe(&input).await {
+    let mut outcome = match send_initial_probe(&mut input).await {
         Ok(outcome) => outcome,
-        Err(error) => {
-            let message = error.to_string();
-            let reason = if message.starts_with("a2mcp_invalid_typed_params")
-                || message.starts_with("invalid_a2mcp_params")
-            {
-                "invalid_a2mcp_params"
-            } else {
-                "endpoint_failure"
-            };
-            return Ok(ProbeDecision::blocked(
-                reason,
-                json!({"schemaVersion":1,"message":message}),
-            ));
-        }
+        Err(error) => return Ok(probe_error_decision(error)),
     };
     let fallback_method = match &outcome {
         HttpOutcome::MethodRequired { allow } => {
             fallback_method_for_405(&input.snapshot.method, allow.as_deref())
         }
-        HttpOutcome::Failed { status, body } => fallback_method_for_400(
-            &input.snapshot.method,
-            *status,
-            body,
-            &input.typed_params,
-            &input.snapshot.param_plan,
-        ),
+        HttpOutcome::Failed { status, body } => {
+            if should_retry_default_get_after_failure(&input) {
+                Some("POST".to_string())
+            } else {
+                fallback_method_for_400(
+                    &input.snapshot.method,
+                    *status,
+                    body,
+                    &input.typed_params,
+                    &input.snapshot.param_plan,
+                )
+            }
+        }
         HttpOutcome::Free { .. }
         | HttpOutcome::InputRequired(_)
         | HttpOutcome::Challenge { .. } => None,
@@ -62,20 +55,7 @@ pub(super) async fn run_probe(args: &ProbeArgs) -> Result<ProbeDecision> {
         input.snapshot.method_was_defaulted = false;
         outcome = match send_probe(&input).await {
             Ok(outcome) => outcome,
-            Err(error) => {
-                let message = error.to_string();
-                let reason = if message.starts_with("a2mcp_invalid_typed_params")
-                    || message.starts_with("invalid_a2mcp_params")
-                {
-                    "invalid_a2mcp_params"
-                } else {
-                    "endpoint_failure"
-                };
-                return Ok(ProbeDecision::blocked(
-                    reason,
-                    json!({"schemaVersion":1,"message":message}),
-                ));
-            }
+            Err(error) => return Ok(probe_error_decision(error)),
         };
     }
     if should_verify_default_get_challenge_with_post(&input, &outcome) {
@@ -146,6 +126,29 @@ pub(super) async fn run_probe(args: &ProbeArgs) -> Result<ProbeDecision> {
             build_payment_decision(&input, challenge, body).await
         }
     }
+}
+
+pub(super) async fn send_initial_probe(input: &mut ProbeInput) -> Result<HttpOutcome> {
+    match send_probe(input).await {
+        Err(_) if should_retry_default_get_after_failure(input) => {
+            input.snapshot.method = "POST".to_string();
+            input.snapshot.method_was_defaulted = false;
+            send_probe(input).await
+        }
+        outcome => outcome,
+    }
+}
+
+fn probe_error_decision(error: anyhow::Error) -> ProbeDecision {
+    let message = error.to_string();
+    let reason = if message.starts_with("a2mcp_invalid_typed_params")
+        || message.starts_with("invalid_a2mcp_params")
+    {
+        "invalid_a2mcp_params"
+    } else {
+        "endpoint_failure"
+    };
+    ProbeDecision::blocked(reason, json!({"schemaVersion":1,"message":message}))
 }
 
 pub(super) fn free_confirmation_decision(

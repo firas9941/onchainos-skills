@@ -1482,12 +1482,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dotenvy"
-version = "0.15.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
-
-[[package]]
 name = "dunce"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2677,7 +2671,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "onchainos-cli"
-version = "4.6.1"
+version = "4.6.2"
 dependencies = [
  "aes-gcm",
  "alloy-consensus",
@@ -2697,7 +2691,6 @@ dependencies = [
  "clap",
  "coins-bip32",
  "dirs",
- "dotenvy",
  "ed25519-dalek",
  "fs2",
  "futures-util",

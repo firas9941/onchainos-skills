@@ -96,7 +96,7 @@ fn wallet_status_it_001_clean_install_reports_ok() {
 // ── IT-002: login writes credential files privately (mock) ─────────────────
 
 #[test]
-#[ignore = "network_required=mock (IT-002): needs the OKX mock login backend. When wired: stage OKX_API_KEY/SECRET/PASSPHRASE, run `wallet login`, assert ok:true, then assert session.json AND wallets.json exist at mode 0600 under ONCHAINOS_HOME (spec §8.5 rows 2-3, AC#4)."]
+#[ignore = "network_required=mock (IT-002): needs the OKX mock login backend. When wired: run `wallet login`, assert ok:true, then assert session.json AND wallets.json exist at mode 0600 under ONCHAINOS_HOME (spec §8.5 rows 2-3, AC#4)."]
 fn wallet_login_it_002_writes_credentials_0600_against_mock_backend() {
     // Intentionally empty — see #[ignore] reason above.
 }
@@ -182,7 +182,7 @@ fn wallet_logout_it_202_migrates_stale_cwd_config_to_home() {
     fs::create_dir_all(&stale_dir).expect("create cwd .onchainos");
     fs::write(
         stale_dir.join("config.json"),
-        br#"{"base_url":"","active_wallet":"acc-1","default_chain":"ethereum"}"#,
+        br#"{"active_wallet":"acc-1","default_chain":"ethereum"}"#,
     )
     .expect("write stale cwd config.json");
 

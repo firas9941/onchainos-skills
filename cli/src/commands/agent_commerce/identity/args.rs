@@ -210,6 +210,9 @@ pub struct GetMyAgentsArgs {
     /// Filter to agents owned by this address.
     #[arg(long = "owner-address")]
     pub owner_address: Option<String>,
+    /// Optional. Filter to specific Agent ID(s), comma-separated.
+    #[arg(long = "agent-ids")]
+    pub agent_ids: Option<String>,
     /// Page number (1-based). Defaults to 1.
     #[arg(long)]
     pub page: Option<String>,

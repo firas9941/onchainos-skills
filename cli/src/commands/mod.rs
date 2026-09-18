@@ -30,7 +30,6 @@ use anyhow::Result;
 /// Shared execution context for all commands.
 pub struct Context {
     pub config: AppConfig,
-    pub base_url_override: Option<String>,
     pub chain_override: Option<String>,
 }
 
@@ -39,21 +38,20 @@ impl Context {
         let config = AppConfig::load().unwrap_or_default();
         Self {
             config,
-            base_url_override: cli.base_url.clone(),
             chain_override: cli.chain.clone(),
         }
     }
 
-    /// Create an OKX API client with HMAC-SHA256 authentication (no JWT expiry check).
+    /// Create an OKX API client without performing an async JWT expiry check.
     /// Prefer `client_async()` in async command handlers.
     pub fn client(&self) -> Result<ApiClient> {
-        ApiClient::new(self.base_url_override.as_deref())
+        ApiClient::new()
     }
 
     /// Create an OKX API client with full JWT lifecycle check:
-    /// expired JWT → auto-refresh; refresh token expired → AK / anonymous fallback.
+    /// expired JWT → auto-refresh; refresh token expired → anonymous fallback.
     pub async fn client_async(&self) -> Result<ApiClient> {
-        ApiClient::new_async(self.base_url_override.as_deref()).await
+        ApiClient::new_async().await
     }
 
     /// Resolve chain to OKX chainIndex (e.g. "ethereum" -> "1", "solana" -> "501").
@@ -94,7 +92,6 @@ mod tests {
     fn ctx_no_override() -> Context {
         Context {
             config: AppConfig::default(),
-            base_url_override: None,
             chain_override: None,
         }
     }
@@ -102,7 +99,6 @@ mod tests {
     fn ctx_with_override(chain: &str) -> Context {
         Context {
             config: AppConfig::default(),
-            base_url_override: None,
             chain_override: Some(chain.to_string()),
         }
     }

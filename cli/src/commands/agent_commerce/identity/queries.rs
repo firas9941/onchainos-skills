@@ -117,10 +117,10 @@ pub(super) async fn get_my_agents_with_access_token(
 
     let mut out = normalize_singleton_object(result?);
     // Additive: enrich each agent row with computed display fields (roleLabel
-    // / statusLabel / approvalLabel / ratingStars). Rows are read from either
-    // the single-layer shape (row = list[*]) or the legacy double-layer shape
-    // (row = list[*].agentList[*]); both are tolerated. Raw role / status /
-    // approvalDisplayStatus / reputation are left intact.
+    // / statusLabel / approvalLabel / ratingStars). Rows are read from the
+    // live double-layer shape (row = list[*].agentList[*]) or the
+    // single-layer fallback (row = list[*]); both are tolerated. Raw role /
+    // status / approvalDisplayStatus / reputation are left intact.
     enrich_agent_get_rows(&mut out);
     // Additive: add a ready-to-render `cells` array per row (the list-table
     // analog of `card`; references/identity/profile.md §My Agents columns). `agent get` is
@@ -136,10 +136,14 @@ fn build_get_my_agents_query(args: &GetMyAgentsArgs) -> Result<Vec<(String, Stri
     // Optional listing filters. `role` accepts the canonical values
     // user/asp/evaluator only (strict — no aliases) and is sent to the backend
     // as its integer code (1/2/3). `ownerAddress` filters to a single owner.
+    // `agentIdList` narrows to specific agents — the raw comma-joined string is
+    // forwarded as-is (same contract as `agent get`'s `--agent-ids`; the
+    // backend owns splitting/validation).
     if let Some(role_raw) = args.role.as_deref().filter(|r| !r.trim().is_empty()) {
         query.push(("role".to_string(), normalize_role_code(role_raw)?));
     }
     push_optional_query(&mut query, "ownerAddress", args.owner_address.as_deref());
+    push_optional_query(&mut query, "agentIdList", args.agent_ids.as_deref());
     if let Some(page_raw) = args.page.as_deref() {
         let page = parse_u32_arg(Some(page_raw), "--page", 1, Some(1), None, false)?;
         query.push(("page".to_string(), page.to_string()));
@@ -200,10 +204,10 @@ async fn get_impl(args: &GetArgs, ctx: &Context) -> Result<Value> {
 
     let mut out = normalize_singleton_object(result?);
     // Additive: enrich each agent row with computed display fields (roleLabel
-    // / statusLabel / approvalLabel / ratingStars). Rows are read from either
-    // the single-layer shape (row = list[*]) or the legacy double-layer shape
-    // (row = list[*].agentList[*]); both are tolerated. Raw role / status /
-    // approvalDisplayStatus / reputation are left intact.
+    // / statusLabel / approvalLabel / ratingStars). Rows are read from the
+    // live double-layer shape (row = list[*].agentList[*]) or the
+    // single-layer fallback (row = list[*]); both are tolerated. Raw role /
+    // status / approvalDisplayStatus / reputation are left intact.
     enrich_agent_get_rows(&mut out);
     // Additive: in LIST mode (no --agent-ids) add a ready-to-render `cells`
     // array per row (references/identity/profile.md §My Agents columns). Detail mode (with
@@ -626,12 +630,38 @@ mod tests {
         let query = build_get_my_agents_query(&GetMyAgentsArgs {
             role: None,
             owner_address: None,
+            agent_ids: None,
             page: None,
             page_size: None,
         })
         .unwrap();
 
         assert_eq!(query[1], ("pageSize".to_string(), "10".to_string()));
+    }
+
+    #[test]
+    fn get_my_agents_query_forwards_agent_ids_as_agent_id_list() {
+        let query = build_get_my_agents_query(&GetMyAgentsArgs {
+            role: Some("user".to_string()),
+            owner_address: None,
+            agent_ids: Some("13373,9967".to_string()),
+            page: None,
+            page_size: Some("5".to_string()),
+        })
+        .unwrap();
+
+        assert!(
+            query.contains(&("agentIdList".to_string(), "13373,9967".to_string())),
+            "expected agentIdList in query, got {query:?}"
+        );
+        assert!(
+            query.contains(&("role".to_string(), "1".to_string())),
+            "role filter must still be present alongside agent_ids, got {query:?}"
+        );
+        assert!(
+            query.contains(&("pageSize".to_string(), "5".to_string())),
+            "page_size filter must still be present alongside agent_ids, got {query:?}"
+        );
     }
 
     #[test]

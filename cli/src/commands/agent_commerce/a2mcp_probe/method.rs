@@ -40,13 +40,13 @@ pub(super) fn resolve_request_method(
     Ok("GET".to_string())
 }
 
-/// Resolve a single unsigned-probe fallback after HTTP 405. When `Allow` is
-/// present it is authoritative; otherwise 405 itself is sufficient evidence
-/// to try the only other method supported by the initial A2MCP contract.
+/// Resolve a single unsigned-probe fallback after HTTP 405. `Allow` is
+/// authoritative in either direction. Without it, only the safe default
+/// GET-to-POST probe fallback is attempted; POST never guesses GET.
 pub(super) fn fallback_method_for_405(current_method: &str, allow: Option<&str>) -> Option<String> {
     let alternate = match current_method {
         "GET" => "POST",
-        "POST" => "GET",
+        "POST" if allow.is_some() => "GET",
         _ => return None,
     };
     if let Some(allow) = allow {
@@ -56,6 +56,13 @@ pub(super) fn fallback_method_for_405(current_method: &str, allow: Option<&str>)
         return permits_alternate.then(|| alternate.to_string());
     }
     Some(alternate.to_string())
+}
+
+/// Only a GET chosen because the service omitted method information receives
+/// the broad failure fallback. An explicitly declared GET remains authoritative
+/// unless the existing 405/400 evidence-specific rules select POST.
+pub(super) fn should_retry_default_get_after_failure(input: &ProbeInput) -> bool {
+    input.snapshot.method_was_defaulted && input.snapshot.method == "GET"
 }
 
 /// A default GET that only reached an x402 challenge has not yet proved that

@@ -11,6 +11,8 @@ const SUBSCRIPTION_CREATE: &str =
     include_str!("../../skills/okx-ai/references/a2a/user/subscription-create.md");
 const SUBSCRIPTION_QUERY: &str =
     include_str!("../../skills/okx-ai/references/a2a/user/subscription.md");
+const SUBSCRIPTION_MANAGE: &str =
+    include_str!("../../skills/okx-ai/references/a2a/user/subscription-manage.md");
 const GUIDE: &str = include_str!("../../skills/okx-ai/references/a2a/user/create-guide.md");
 const REFUND_PREPARE: &str =
     include_str!("../../skills/okx-ai/references/a2a/user/refund-prepare.md");
@@ -82,6 +84,7 @@ fn create_confirmation_omits_follow_trade_configuration() {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
+    let guide = GUIDE.split_whitespace().collect::<Vec<_>>().join(" ");
     for forbidden in [
         "| Signal Execution |",
         "| Per-Signal Amount |",
@@ -102,9 +105,18 @@ fn create_confirmation_omits_follow_trade_configuration() {
     assert!(subscription_create.contains("one explicit final confirmation"));
     assert!(subscription_create.contains("Automatic copy-trading preference"));
     assert!(subscription_create.contains("Do not ask an additional platform-level mode question"));
-    assert!(GUIDE.contains("silently persist that answer before asking the next"));
+    assert!(subscription_create.contains("Do not narrate internal preparation"));
+    assert!(subscription_create.contains("will not enter GuideDirect/claim"));
+    assert!(subscription_create.contains("classify the subscription as"));
+    assert!(subscription_create.contains("pure signal"));
+    assert!(subscription_create.contains("save `signal_only`"));
+    assert!(subscription_create.contains("use `{}` only when"));
+    assert!(guide.contains("silently persist that answer before asking the next"));
     assert!(GUIDE.contains("subscription-execution-config-set"));
-    assert!(subscription_create.contains("one-time tasks never configure it"));
+    assert!(guide.contains("never ask a separate copy-trading question just because"));
+    assert!(guide.contains("claim will not run"));
+    assert!(guide.contains("Pure-signal subscriptions with a non-blank Guide still need Guide Consent"));
+    assert!(subscription_create.contains("One-time tasks never configure automatic copy-trading"));
     assert!(!SUBSCRIPTION_CREATE.contains("Guide Consent remains a separate confirmation"));
     let subscription_detail = SUBSCRIPTION_QUERY.split_once("## Detail").unwrap().1;
     assert!(subscription_detail.contains("- Job ID: {jobId}"));
@@ -113,6 +125,16 @@ fn create_confirmation_omits_follow_trade_configuration() {
     assert!(SUBSCRIPTION_QUERY.contains("use `Refund completed`"));
     assert!(!subscription_detail.contains("| Job Name |"));
     assert!(create.contains("Keep Guide Consent in its separate confirmation"));
+}
+
+#[test]
+fn guide_direct_subscription_reminds_users_that_copy_trade_status_is_queryable() {
+    let reminder = "Automatic copy-trading is enabled. You can ask me about the copy-trading status at any time.";
+    assert_eq!(SUBSCRIPTION_MANAGE.matches(reminder).count(), 1);
+    assert!(SUBSCRIPTION_MANAGE.contains("after the initial successful subscription\nconfirmation"));
+    assert!(SUBSCRIPTION_MANAGE.contains("after receipt is restored and before\n   watch"));
+    assert!(SUBSCRIPTION_MANAGE.contains("Show this reminder once after the initial successful subscription confirmation,\nand once after a successful listening/receipt restoration."));
+    assert!(SUBSCRIPTION_MANAGE.contains("Do not show it for a\n`signal_only` subscription"));
 }
 
 #[test]

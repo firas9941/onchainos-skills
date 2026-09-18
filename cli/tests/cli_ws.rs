@@ -130,7 +130,7 @@ fn ws_channel_info_it_203_leaves_config_0644() {
     // untouched (spec §8.3 D2, §8.4).
     let (_tmp, home) = fresh_home(SANDBOX_STEM);
     let config = home.join("config.json");
-    fs::write(&config, br#"{"base_url":""}"#).expect("write config.json");
+    fs::write(&config, br#"{}"#).expect("write config.json");
     fs::set_permissions(&config, fs::Permissions::from_mode(0o644)).expect("chmod 0644");
 
     let output = scrubbed(&mut onchainos(), &home)

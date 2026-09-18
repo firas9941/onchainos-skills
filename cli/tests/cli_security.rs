@@ -196,7 +196,7 @@ fn sig_scan_solana_chain_rejected() {
 // ── token-scan: --trade-direction action classification (WWINFRA-3509 SEC) ──
 //
 // Integration-plan rows IT-001 … IT-004. `security token-scan` is an
-// anonymous/AK endpoint, so no wallet login is required. IT-001/002/003 are
+// anonymous endpoint, so no wallet login is required. IT-001/002/003 are
 // `live` golden/edge rows routed through the shared `run_with_retry` helper;
 // IT-004 is an `offline` clap value-validation error (no retry helper).
 
