@@ -16,9 +16,6 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use super::store::{append_events, write_pid, write_status};
 use super::types::{channel_pattern, ChannelPattern, WatchConfig, WatchEnv};
 
-const WS_URL_PROD: &str = "wss://wsdex.okx.com/ws/v6/dex";
-const WS_URL_PRE: &str = "wss://wsdexpre.okx.com:8443/ws/v6/dex";
-
 const HEARTBEAT_SECS: u64 = 25;
 const PONG_TIMEOUT_SECS: u64 = 10;
 const RECONNECT_DELAY_SECS: u64 = 3;
@@ -43,18 +40,11 @@ impl Credentials {
             }),
             WatchEnv::Prod => Ok(Self {
                 api_key: std::env::var("OKX_PROD_API_KEY")
-                    .or_else(|_| std::env::var("OKX_API_KEY"))
-                    .map_err(|_| anyhow::anyhow!("OKX_PROD_API_KEY or OKX_API_KEY is not set"))?,
+                    .map_err(|_| anyhow::anyhow!("OKX_PROD_API_KEY is not set"))?,
                 secret_key: std::env::var("OKX_PROD_SECRET_KEY")
-                    .or_else(|_| std::env::var("OKX_SECRET_KEY"))
-                    .map_err(|_| {
-                        anyhow::anyhow!("OKX_PROD_SECRET_KEY or OKX_SECRET_KEY is not set")
-                    })?,
+                    .map_err(|_| anyhow::anyhow!("OKX_PROD_SECRET_KEY is not set"))?,
                 passphrase: std::env::var("OKX_PROD_PASSPHRASE")
-                    .or_else(|_| std::env::var("OKX_PASSPHRASE"))
-                    .map_err(|_| {
-                        anyhow::anyhow!("OKX_PROD_PASSPHRASE or OKX_PASSPHRASE is not set")
-                    })?,
+                    .map_err(|_| anyhow::anyhow!("OKX_PROD_PASSPHRASE is not set"))?,
             }),
         }
     }
@@ -148,10 +138,7 @@ pub async fn run_daemon(_id: &str, dir: &Path) -> Result<()> {
             }
         }
     });
-    let ws_url = std::env::var("ONCHAINOS_WS_URL").unwrap_or_else(|_| match config.env {
-        WatchEnv::Pre => WS_URL_PRE.to_string(),
-        WatchEnv::Prod => WS_URL_PROD.to_string(),
-    });
+    let ws_url = crate::endpoints::WS_URL;
     let creds = match Credentials::from_watch_env(&config.env) {
         Ok(c) => c,
         Err(e) => {
@@ -164,7 +151,7 @@ pub async fn run_daemon(_id: &str, dir: &Path) -> Result<()> {
     let mut attempts = 0u32;
     loop {
         heartbeat_active.store(true, Ordering::Relaxed);
-        match connect_and_stream(dir, &ws_url, &creds, &config, &idle_expired).await {
+        match connect_and_stream(dir, ws_url, &creds, &config, &idle_expired).await {
             Ok(reason) => {
                 heartbeat_active.store(false, Ordering::Relaxed);
                 attempts = 0; // reset after successful session

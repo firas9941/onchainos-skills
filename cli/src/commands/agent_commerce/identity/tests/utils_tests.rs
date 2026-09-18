@@ -1,22 +1,13 @@
 use super::*;
 use serde_json::json;
 use super::super::models::{AgentCard, AgentService, ServiceOperation, SubscriptionTier};
-use crate::client::DEFAULT_BASE_URL;
 use crate::commands::Context;
 use crate::config::AppConfig;
+use crate::endpoints::{AGENT_IDENTITY_WS_URL, BASE_URL};
 
 fn ctx_no_override() -> Context {
     Context {
         config: AppConfig::default(),
-        base_url_override: None,
-        chain_override: None,
-    }
-}
-
-fn ctx_with_base(url: &str) -> Context {
-    Context {
-        config: AppConfig::default(),
-        base_url_override: Some(url.to_string()),
         chain_override: None,
     }
 }
@@ -1105,11 +1096,11 @@ fn enrich_agent_get_rows_walks_double_layer_envelope() {
 
 // ─── REAL backend shapes (live /agent-list & /service-list verified) ──
 //
-// The live `/agent-list` endpoint returns a SINGLE-layer `list[*]` of flat
-// agent rows with INTEGER role and `profileDescription` / `profilePicture`
-// / `agentWalletAddress` field names (NOT the double-layer / string-role /
-// `description` schema the older doc + synthetic tests above assume). These
-// tests pin the tolerant handling against the real shapes.
+// The live `/agent-list` endpoint returns a DOUBLE-layer `list[*].agentList[*]`
+// envelope, grouped by owning account, with INTEGER role and
+// `profileDescription` / `profilePicture` / `agentWalletAddress` field names.
+// These tests pin the tolerant handling against the real shape and its
+// defensive single-layer fallback (not observed live).
 
 #[test]
 fn enrich_agent_row_accepts_integer_role() {
@@ -1125,7 +1116,8 @@ fn enrich_agent_row_accepts_integer_role() {
 
 #[test]
 fn enrich_agent_get_rows_walks_single_layer_envelope() {
-    // Live `/agent-list` shape: data.list[*] are flat agent rows, NO
+    // Defensive fallback shape (not observed on the live endpoint, which
+    // always groups via `agentList`): data.list[*] are flat agent rows, NO
     // `agentList` sub-layer.
     let mut env = json!({
         "total": 1,
@@ -1495,7 +1487,7 @@ fn parse_agent_unsigned_reads_sign_type_and_extra_data() {
 fn reconstruct_get_url_no_query_omits_question_mark() {
     let ctx = ctx_no_override();
     let url = reconstruct_get_url_for_log(&ctx, "/api/v1/agents", &[]);
-    assert_eq!(url, format!("{DEFAULT_BASE_URL}/api/v1/agents"));
+    assert_eq!(url, format!("{BASE_URL}/api/v1/agents"));
     assert!(!url.contains('?'));
 }
 
@@ -1507,7 +1499,7 @@ fn reconstruct_get_url_non_empty_query_appends_pairs() {
         "/api/v1/agents",
         &[("chainIndex", "196"), ("page", "1")],
     );
-    assert!(url.starts_with(&format!("{DEFAULT_BASE_URL}/api/v1/agents?")));
+    assert!(url.starts_with(&format!("{BASE_URL}/api/v1/agents?")));
     assert!(url.contains("chainIndex=196"));
     assert!(url.contains("page=1"));
 }
@@ -1538,10 +1530,10 @@ fn reconstruct_get_url_all_empty_values_omits_question_mark() {
 }
 
 #[test]
-fn reconstruct_get_url_respects_base_url_override() {
-    let ctx = ctx_with_base("https://pre.example.com");
+fn reconstruct_get_url_uses_compiled_base_url() {
+    let ctx = ctx_no_override();
     let url = reconstruct_get_url_for_log(&ctx, "/api/v1/test", &[("k", "v")]);
-    assert!(url.starts_with("https://pre.example.com/api/v1/test?"));
+    assert!(url.starts_with(&format!("{BASE_URL}/api/v1/test?")));
     assert!(url.contains("k=v"));
 }
 
@@ -2253,46 +2245,22 @@ fn format_top_service_truncates_at_40_chars() {
 // ─── reconstruct_post_url_for_log ─────────────────────────────────────────
 
 #[test]
-fn reconstruct_post_url_for_log_uses_default_base_url_when_no_override() {
+fn reconstruct_post_url_for_log_uses_compiled_base_url() {
     let url = reconstruct_post_url_for_log(&ctx_no_override(), "/agent/create");
-    assert_eq!(url, format!("{}{}", DEFAULT_BASE_URL, "/agent/create"));
-}
-
-#[test]
-fn reconstruct_post_url_for_log_uses_override_base_url() {
-    let url = reconstruct_post_url_for_log(&ctx_with_base("https://pre.okx.com"), "/agent/create");
-    assert_eq!(url, "https://pre.okx.com/agent/create");
+    assert_eq!(url, format!("{}{}", BASE_URL, "/agent/create"));
 }
 
 #[test]
 fn reconstruct_post_url_for_log_appends_path_verbatim() {
-    let url = reconstruct_post_url_for_log(&ctx_with_base("https://pre.okx.com"), "/agent/sign?foo=bar");
-    assert_eq!(url, "https://pre.okx.com/agent/sign?foo=bar");
+    let url = reconstruct_post_url_for_log(&ctx_no_override(), "/agent/sign?foo=bar");
+    assert_eq!(url, format!("{BASE_URL}/agent/sign?foo=bar"));
 }
 
 // ─── identity_ws_url ─────────────────────────────────────────────────────
 
-const WS_URL_PROD: &str = "wss://wsdex.okx.com:8443/ws/v5/private";
-
-// Serialize env-var tests to prevent data races under `cargo test`'s default
-// multi-threaded runner. Both tests mutate the process-global OKX_AGENTIC_WS_URL
-// var, so they must not execute concurrently.
-static WS_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 #[test]
-fn identity_ws_url_returns_prod_default_when_env_unset() {
-    let _lock = WS_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::remove_var("OKX_AGENTIC_WS_URL");
-    assert_eq!(identity_ws_url(), WS_URL_PROD);
-}
-
-#[test]
-fn identity_ws_url_returns_override_when_env_set() {
-    let _lock = WS_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::set_var("OKX_AGENTIC_WS_URL", "wss://pre-ws.okx.com/ws/v5/private");
-    let url = identity_ws_url();
-    std::env::remove_var("OKX_AGENTIC_WS_URL");
-    assert_eq!(url, "wss://pre-ws.okx.com/ws/v5/private");
+fn identity_ws_url_uses_compiled_endpoint() {
+    assert_eq!(identity_ws_url(), AGENT_IDENTITY_WS_URL);
 }
 
 // ─── build_precheck: reason field ────────────────────────────────────────

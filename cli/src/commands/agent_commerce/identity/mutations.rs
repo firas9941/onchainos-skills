@@ -193,10 +193,10 @@ async fn create_impl(args: &CreateArgs, ctx: &Context) -> Result<Value> {
 
     // Open the wallet-agentic-identity subscription before broadcast; any failure
     // degrades gracefully and does not block the broadcast.
-    // identity_ws_url() defaults to WS_URL_PROD; override with OKX_AGENTIC_WS_URL.
+    // Use the compile-time wallet-agentic-identity WebSocket endpoint.
     // push-platform login uses the wallet address as the "token" value (not a JWT).
     let subscription =
-        match open_identity_subscription(&from_addr, &identity_ws_url()).await {
+        match open_identity_subscription(&from_addr, identity_ws_url()).await {
         Ok(s) => Some(s),
         Err(e) => {
             debug_log!(
@@ -485,11 +485,11 @@ async fn update_impl(args: &UpdateArgs, ctx: &Context) -> Result<Value> {
 
     // Open the wallet-agentic-identity subscription before broadcast; any failure
     // degrades gracefully and does not block the broadcast.
-    // identity_ws_url() defaults to WS_URL_PROD; override with OKX_AGENTIC_WS_URL.
+    // Use the compile-time wallet-agentic-identity WebSocket endpoint.
     // push-platform login uses the wallet address as the "token" value (not a JWT).
     let subscription = match open_identity_subscription(
         &signing_session.addr_info.address,
-        &identity_ws_url(),
+        identity_ws_url(),
     )
     .await
     {

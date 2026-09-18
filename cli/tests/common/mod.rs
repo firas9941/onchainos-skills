@@ -291,8 +291,8 @@ pub fn fresh_home(stem: &str) -> (TestHome, std::path::PathBuf) {
     (TestHome { path: dir.clone() }, dir)
 }
 
-/// Strip inherited `OKX_*` / `ONCHAINOS_HOME` / `OKX_DOH_BINARY_PATH` env so each
-/// test sees a pristine environment, then pin `ONCHAINOS_HOME` to `home`
+/// Strip inherited home / DoH env vars so each test sees a pristine
+/// environment, then pin `ONCHAINOS_HOME` to `home`
 /// **per-invocation** via `Command::env` (never `std::env::set_var`, which is
 /// process-global and races across parallel tests). The caller re-sets only what
 /// the specific case needs after this.
@@ -300,12 +300,7 @@ pub fn scrubbed<'a>(
     cmd: &'a mut assert_cmd::Command,
     home: &std::path::Path,
 ) -> &'a mut assert_cmd::Command {
-    cmd.env_remove("OKX_API_KEY")
-        .env_remove("OKX_ACCESS_KEY")
-        .env_remove("OKX_SECRET_KEY")
-        .env_remove("OKX_PASSPHRASE")
-        .env_remove("OKX_BASE_URL")
-        .env_remove("OKX_DOH_BINARY_PATH")
+    cmd.env_remove("OKX_DOH_BINARY_PATH")
         .env("ONCHAINOS_HOME", home)
 }
 

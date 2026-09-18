@@ -37,9 +37,6 @@ pub const X402_UPTO_PERMIT2_PROXY: &str = "0x4020e7393B728A3939659E5732F87fdd8e6
 // flow refuses to attempt allowance pre-check on unsupported chains.
 // ---------------------------------------------------------------------------
 
-/// X Layer mainnet public RPC endpoint.
-pub const XLAYER_RPC_URL: &str = "https://rpc.xlayer.tech";
-
 /// Look up the public EVM RPC endpoint for a given chain index, if supported.
 ///
 /// Returns `None` for chains where we haven't wired up an endpoint yet.
@@ -48,7 +45,7 @@ pub const XLAYER_RPC_URL: &str = "https://rpc.xlayer.tech";
 /// route through a backend allowance API".
 pub fn rpc_url_for_chain(chain_index: &str) -> Option<&'static str> {
     match chain_index {
-        "196" => Some(XLAYER_RPC_URL),
+        "196" => Some(crate::endpoints::XLAYER_RPC_URL),
         _ => None,
     }
 }
@@ -466,7 +463,10 @@ mod tests {
     fn rpc_url_for_chain_xlayer_only() {
         // Only X Layer is wired up for now — verify both that it works and
         // that we don't accidentally claim to support other chains.
-        assert_eq!(rpc_url_for_chain("196"), Some(XLAYER_RPC_URL));
+        assert_eq!(
+            rpc_url_for_chain("196"),
+            Some(crate::endpoints::XLAYER_RPC_URL)
+        );
         assert_eq!(rpc_url_for_chain("8453"), None); // Base
         assert_eq!(rpc_url_for_chain("1"), None); // Ethereum
         assert_eq!(rpc_url_for_chain("1952"), None); // X Layer testnet — explicitly not wired

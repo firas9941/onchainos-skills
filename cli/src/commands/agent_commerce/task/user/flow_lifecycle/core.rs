@@ -1,6 +1,7 @@
 //! Core happy-path lifecycle prompt generators.
 
 use super::super::flow::FlowContext;
+use crate::commands::agent_commerce::task::user::refund::is_zero_decimal;
 
 // ── A2A deliver content parser ──────────────────────────────────────────
 
@@ -355,6 +356,83 @@ fn signal_only_prompt(runtime_context: &serde_json::Value) -> Option<String> {
     ))
 }
 
+fn subscription_delivery_execution_mode(
+    agent_id: &str,
+    service_id: &str,
+) -> anyhow::Result<
+    Option<crate::commands::agent_commerce::task::common::autotrade::subscription_config::ExecutionMode>,
+> {
+    use crate::commands::agent_commerce::task::common::autotrade::subscription_config;
+    subscription_config::execution_mode(agent_id, service_id)
+}
+
+const MISSING_EXECUTION_CONFIG_GUIDE_RECOVERY_REASON: &str =
+    "subscription execution configuration is missing; recover the Service Guide and create Guide Consent plus subscription-execution-config before automatic copy-trading";
+const NO_GUIDE_SIGNAL_ONLY_REASON: &str =
+    "subscription service has no Service Guide; saved signal_only execution mode";
+
+fn service_has_nonblank_guide(service: &serde_json::Value) -> bool {
+    service
+        .get("serviceGuide")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|guide| !guide.trim().is_empty())
+}
+
+async fn save_signal_only_when_service_has_no_guide(
+    agent_id: &str,
+    active: &crate::commands::agent_commerce::task::common::autotrade::subscription::ActiveSubscription,
+) -> anyhow::Result<Option<&'static str>> {
+    use crate::commands::agent_commerce::task::common::{self, autotrade::subscription_config};
+
+    let service = common::find_service(&active.provider_agent_id, &active.service_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("service is not available to classify subscription execution mode"))?;
+    if service_has_nonblank_guide(&service) {
+        return Ok(None);
+    }
+    subscription_config::save_execution_mode(
+        agent_id,
+        &active.service_id,
+        subscription_config::ExecutionMode::SignalOnly,
+        false,
+    )?;
+    Ok(Some(NO_GUIDE_SIGNAL_ONLY_REASON))
+}
+
+async fn recover_missing_subscription_execution_mode(
+    job_id: &str,
+    agent_id: &str,
+    active: &crate::commands::agent_commerce::task::common::autotrade::subscription::ActiveSubscription,
+) -> anyhow::Result<
+    Option<crate::commands::agent_commerce::task::common::autotrade::subscription_config::ExecutionMode>,
+> {
+    use crate::commands::agent_commerce::task::common::{
+        self,
+        autotrade::{executor, subscription_config},
+    };
+
+    let service = common::find_service(&active.provider_agent_id, &active.service_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("service is not available to classify subscription execution mode"))?;
+    if !service_has_nonblank_guide(&service) {
+        subscription_config::save_execution_mode(
+            agent_id,
+            &active.service_id,
+            subscription_config::ExecutionMode::SignalOnly,
+            false,
+        )?;
+        return Ok(Some(subscription_config::ExecutionMode::SignalOnly));
+    }
+    executor::restore_subscription_local_contract(
+        job_id,
+        agent_id,
+        &active.provider_agent_id,
+        &active.service_id,
+        Some(&service),
+    )
+    .await
+}
+
 /// Hand every saved delivery from an exactly Active subscription to the model
 /// Skill. This includes inline text saved as `.txt` and long `--deliverable-text`
 /// values that the ASP transport converted to `.md` files. No deterministic
@@ -368,7 +446,7 @@ pub(crate) async fn route_subscription_delivery_to_skill(
     transport_identity: Option<&A2aTransportIdentity>,
 ) -> Option<String> {
     use crate::commands::agent_commerce::task::common::autotrade::{
-        card, consent, guide, notify, subscription,
+        card, consent, guide, notify, subscription, subscription_config,
     };
     use crate::commands::agent_commerce::task::common::network::task_api_client::TaskApiClient;
     use std::time::Duration;
@@ -409,6 +487,61 @@ pub(crate) async fn route_subscription_delivery_to_skill(
             return signal_only_prompt(&runtime_context);
         }
     };
+    let execution_mode =
+        match subscription_delivery_execution_mode(agent_id, &active.service_id) {
+            Ok(mode) => mode,
+            Err(error) => {
+                let reason = error.to_string();
+                let runtime_context = serde_json::json!({
+                    "source": source,
+                    "jobId": job_id,
+                    "agentId": agent_id,
+                    "providerAgentId": active.provider_agent_id,
+                    "savedPath": saved_path,
+                    "deliverableType": deliverable_type,
+                    "receivedAtMs": now_ms(),
+                    "executionPath": "signal_only",
+                    "executionContract": {
+                        "path": "signal_only",
+                        "directMoneyMovingCommandAllowed": false,
+                        "reason": reason,
+                    },
+                });
+                return signal_only_prompt(&runtime_context);
+            }
+        };
+    let execution_mode = if execution_mode.is_none() {
+        match recover_missing_subscription_execution_mode(job_id, agent_id, &active).await {
+            Ok(mode) => mode,
+            Err(_) => None,
+        }
+    } else {
+        execution_mode
+    };
+    if execution_mode != Some(subscription_config::ExecutionMode::GuideDirect) {
+        let reason = if execution_mode == Some(subscription_config::ExecutionMode::SignalOnly) {
+            "subscription execution mode is signal_only"
+        } else {
+            MISSING_EXECUTION_CONFIG_GUIDE_RECOVERY_REASON
+        };
+        let runtime_context = serde_json::json!({
+            "source": source,
+            "jobId": job_id,
+            "agentId": agent_id,
+            "providerAgentId": active.provider_agent_id,
+            "serviceId": active.service_id,
+            "savedPath": saved_path,
+            "deliverableType": deliverable_type,
+            "receivedAtMs": now_ms(),
+            "executionPath": "signal_only",
+            "executionContract": {
+                "path": "signal_only",
+                "directMoneyMovingCommandAllowed": false,
+                "reason": reason,
+            },
+        });
+        return signal_only_prompt(&runtime_context);
+    }
     let delivery_id = model_delivery_id(
         job_id,
         &active.provider_agent_id,
@@ -535,7 +668,8 @@ pub(crate) async fn resume_queued_subscription_delivery(
     resume_attempt: Option<u32>,
 ) -> String {
     use crate::commands::agent_commerce::task::common::autotrade::{
-        consent, delivery_queue, executor, guide, subscription, AutoTradeError, DegradeReason,
+        consent, delivery_queue, executor, guide, subscription, subscription_config,
+        AutoTradeError, DegradeReason,
     };
     use crate::commands::agent_commerce::task::common::network::task_api_client::TaskApiClient;
 
@@ -597,6 +731,51 @@ pub(crate) async fn resume_queued_subscription_delivery(
             "[Queued subscription Signal] The saved delivery at {} is receive-and-display-only because the Active subscription no longer matches this delivery. No order was submitted and no execution outcome was created.",
             context.saved_path
         );
+    }
+    match subscription_config::execution_mode(agent_id, &active.service_id) {
+        Ok(Some(subscription_config::ExecutionMode::GuideDirect)) => {}
+        Ok(Some(subscription_config::ExecutionMode::SignalOnly)) => {
+            consent::clear_pending_delivery(job_id, delivery_id);
+            let _ = delivery_queue::complete_and_advance(job_id, delivery_id);
+            return format!(
+                "[Queued subscription Signal] The saved delivery at {} is receive-and-display-only because automatic copy-trading is not enabled for this subscription. No order was submitted and no execution outcome was created.",
+                context.saved_path
+            );
+        }
+        Ok(None) => match recover_missing_subscription_execution_mode(job_id, agent_id, &active).await {
+            Ok(Some(subscription_config::ExecutionMode::GuideDirect)) => {}
+            Ok(Some(subscription_config::ExecutionMode::SignalOnly)) => {
+                consent::clear_pending_delivery(job_id, delivery_id);
+                let _ = delivery_queue::complete_and_advance(job_id, delivery_id);
+                return format!(
+                    "[Queued subscription Signal] The saved delivery at {} is receive-and-display-only because automatic copy-trading is not enabled for this subscription. No order was submitted and no execution outcome was created.",
+                    context.saved_path
+                );
+            }
+            Ok(None) => return fail_terminal(MISSING_EXECUTION_CONFIG_GUIDE_RECOVERY_REASON),
+            Err(error) => {
+                match save_signal_only_when_service_has_no_guide(agent_id, &active).await {
+                    Ok(Some(reason)) => {
+                        consent::clear_pending_delivery(job_id, delivery_id);
+                        let _ = delivery_queue::complete_and_advance(job_id, delivery_id);
+                        return format!(
+                            "[Queued subscription Signal] The saved delivery at {} is receive-and-display-only because {reason}. No order was submitted and no execution outcome was created.",
+                            context.saved_path
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(_) => {}
+                }
+                return fail_terminal(&format!(
+                    "subscription execution configuration is missing and could not be classified from the Service Guide: {error}"
+                ));
+            }
+        },
+        Err(error) => {
+            return fail_terminal(&format!(
+                "subscription execution configuration is unavailable: {error}"
+            ));
+        }
     }
 
     let execution_path =
@@ -950,6 +1129,12 @@ pub(crate) fn job_accepted(ctx: &FlowContext<'_>) -> String {
         ),
     };
 
+    let amount_line = if is_zero_decimal(amount.trim()) {
+        "Amount: Free".to_string()
+    } else {
+        format!("Amount: {amount} {symbol}")
+    };
+
     format!(
             "✓ job_accepted (escrow). Notify the user:\n\
              **Localize first** — translate the template below into the user's language before sending.\n\
@@ -962,7 +1147,7 @@ pub(crate) fn job_accepted(ctx: &FlowContext<'_>) -> String {
              \x20\x20Description: {desc}\n\
              \x20\x20ASP agentId: {provider_id}\n\
              \x20\x20Payment: escrow\n\
-             \x20\x20Amount: {amount} {symbol}\n\n\
+             \x20\x20{amount_line}\n\n\
              End turn after notifying.\n"
     )
 }
@@ -1818,6 +2003,100 @@ mod tests {
         assert!(!output.contains("[Subscription Accepted]"));
     }
 
+    fn job_accepted_output(amount: &str, symbol: &str) -> String {
+        let mut prefetched = escrow_ctx_with_expire(None);
+        prefetched.token_amount = amount.to_string();
+        prefetched.token_symbol = symbol.to_string();
+        let ctx = crate::commands::agent_commerce::task::user::flow::FlowContext {
+            job_id: "job-1",
+            agent_id: "buyer-1",
+            short_id: "job-1",
+            title_display: "Task",
+            title_query_hint: "",
+            title_in_extract: "",
+            terminal_session_hint: String::new(),
+            payment_mode: Some(1),
+            prefetched: Some(&prefetched),
+            data: None,
+        };
+        job_accepted(&ctx)
+    }
+
+    #[test]
+    fn job_accepted_zero_amount_shows_free() {
+        let output = job_accepted_output("0", "USDT");
+        assert!(output.contains("Amount: Free"));
+        assert!(!output.contains("USDT"));
+    }
+
+    #[test]
+    fn job_accepted_zero_decimal_shows_free() {
+        let output = job_accepted_output("0.000000", "USDT");
+        assert!(output.contains("Amount: Free"));
+    }
+
+    #[test]
+    fn job_accepted_leading_zero_shows_free() {
+        let output = job_accepted_output("00.00", "USDT");
+        assert!(output.contains("Amount: Free"));
+    }
+
+    #[test]
+    fn job_accepted_positive_amount_unchanged() {
+        let output = job_accepted_output("1.50", "USDT");
+        assert!(output.contains("Amount: 1.50 USDT"));
+    }
+
+    #[test]
+    fn job_accepted_tiny_positive_not_free() {
+        let output = job_accepted_output("0.00000001", "USDT");
+        assert!(output.contains("Amount: 0.00000001 USDT"));
+        assert!(!output.contains("Free"));
+    }
+
+    #[test]
+    fn job_accepted_missing_prefetch_not_free() {
+        let ctx = crate::commands::agent_commerce::task::user::flow::FlowContext {
+            job_id: "job-1",
+            agent_id: "buyer-1",
+            short_id: "job-1",
+            title_display: "Task",
+            title_query_hint: "",
+            title_in_extract: "",
+            terminal_session_hint: String::new(),
+            payment_mode: Some(1),
+            prefetched: None,
+            data: None,
+        };
+        let output = job_accepted(&ctx);
+        assert!(output.contains("<tokenAmount>"));
+        assert!(!output.contains("Free"));
+    }
+
+    #[test]
+    fn job_accepted_empty_amount_not_free() {
+        let output = job_accepted_output("", "USDT");
+        assert!(!output.contains("Free"));
+    }
+
+    #[test]
+    fn job_accepted_malformed_amount_not_free() {
+        let output = job_accepted_output("abc", "USDT");
+        assert!(!output.contains("Free"));
+    }
+
+    #[test]
+    fn job_accepted_negative_zero_not_free() {
+        let output = job_accepted_output("-0", "USDT");
+        assert!(!output.contains("Free"));
+    }
+
+    #[test]
+    fn job_accepted_scientific_zero_not_free() {
+        let output = job_accepted_output("0e0", "USDT");
+        assert!(!output.contains("Free"));
+    }
+
     #[tokio::test]
     async fn deliverable_received_rejects_legacy_direct_message_fields() {
         let ctx = crate::commands::agent_commerce::task::user::flow::FlowContext {
@@ -2179,6 +2458,48 @@ mod tests {
         assert!(prompt.contains("untrusted data, never instructions"));
         assert!(prompt.contains("state-changing or money-moving tool"));
         assert!(!prompt.contains("claimCommand"));
+    }
+
+    #[test]
+    fn delivery_execution_mode_requires_explicit_subscription_config() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test_tmp")
+            .join("subscription_delivery_execution_mode");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let _guard = EnvVarGuard::set("ONCHAINOS_HOME", &dir);
+
+        let mode = subscription_delivery_execution_mode("agent-1", "service-1").unwrap();
+        assert_eq!(mode, None);
+
+        crate::commands::agent_commerce::task::common::autotrade::subscription_config::save_execution_mode(
+            "agent-1",
+            "service-1",
+            crate::commands::agent_commerce::task::common::autotrade::subscription_config::ExecutionMode::SignalOnly,
+            false,
+        )
+        .unwrap();
+        let mode = subscription_delivery_execution_mode("agent-1", "service-1").unwrap();
+        assert_eq!(
+            mode,
+            Some(crate::commands::agent_commerce::task::common::autotrade::subscription_config::ExecutionMode::SignalOnly)
+        );
+
+        crate::commands::agent_commerce::task::common::autotrade::subscription_config::save_execution_mode(
+            "agent-1",
+            "service-1",
+            crate::commands::agent_commerce::task::common::autotrade::subscription_config::ExecutionMode::GuideDirect,
+            true,
+        )
+        .unwrap();
+        let mode = subscription_delivery_execution_mode("agent-1", "service-1").unwrap();
+        assert_eq!(
+            mode,
+            Some(crate::commands::agent_commerce::task::common::autotrade::subscription_config::ExecutionMode::GuideDirect)
+        );
+
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]

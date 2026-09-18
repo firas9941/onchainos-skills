@@ -30,6 +30,7 @@
 // ── Platform detection ────────────────────────────────────────────
 
 pub use crate::commands::agent_commerce::task::common::config::is_cli_mode;
+use crate::commands::agent_commerce::task::user::refund::is_zero_decimal;
 
 // ── Watch handoff ──────────────────────────────────────────────
 
@@ -89,7 +90,7 @@ pub fn provider_offline_user_prompt(job_id: &str, short_id: &str, dp_id: &str) -
 // ── Event::JobAccepted ─────────────────────────────────────────────
 
 /// `Event::JobAccepted` Branch A (escrow) — user notification that the job is accepted (B-2-1).
-pub fn job_accepted_escrow_user_notify(job_id: &str, _title: &str) -> String {
+pub fn job_accepted_escrow_user_notify(job_id: &str, _title: &str, amount: &str) -> String {
     // The trailing "Waiting for the ASP to ..." sentence reads like a
     // "conversation ending" cue and can cause LLM-driven watch loops
     // (Claude Code / Codex) to stop prematurely. An earlier attempt to
@@ -106,13 +107,20 @@ pub fn job_accepted_escrow_user_notify(job_id: &str, _title: &str) -> String {
     } else {
         "\n         Waiting for the ASP to execute and submit the deliverable."
     };
+    // Exact-zero escrow renders `Amount: Free` (no placeholder tags); non-zero,
+    // empty, or unparsable amounts keep the localizable placeholder line.
+    let amount_line = if is_zero_decimal(amount.trim()) {
+        "Amount: Free"
+    } else {
+        "Amount: <tokenAmount> <tokenSymbol>"
+    };
     format!(
         "[Job Accepted] Job `{job_id}` has been accepted; execution begins.\n\
          Title: <title>\n\
          Description: <description>\n\
          ASP agentId: <providerAgentId>\n\
          Payment: escrow\n\
-         Amount: <tokenAmount> <tokenSymbol>{trailing}"
+         {amount_line}{trailing}"
     )
 }
 
@@ -501,12 +509,12 @@ pub fn sub_open_user_notify(
     );
     match (token_amount, token_symbol) {
         (Some(amount), Some(symbol)) => out.push_str(&format!(
-            " {amount} {symbol} has been funded for the subscription but the subscription is not active yet."
+            " {amount} {symbol} has been funded for the subscription."
         )),
         (Some(amount), None) => out.push_str(&format!(
-            " {amount} has been funded for the subscription but the subscription is not active yet."
+            " {amount} has been funded for the subscription."
         )),
-        _ => out.push_str(" The subscription is not active yet."),
+        _ => {}
     }
     out
 }
@@ -519,7 +527,7 @@ pub fn sub_open_trial_user_notify(
     token_symbol: Option<&str>,
 ) -> String {
     let mut out = format!(
-        "[Trial Subscription Created] Job {job_id} (subscribing to {service_name}) is on-chain and waiting for the ASP to accept. The free trial has not started yet."
+        "[Trial Subscription Created] Job {job_id} (subscribing to {service_name}) is on-chain and waiting for the ASP to accept. The free trial will begin after acceptance."
     );
     if let Some(amount) = token_amount {
         match token_symbol {
@@ -534,7 +542,7 @@ pub fn sub_open_trial_user_notify(
     out
 }
 
-/// `sub_created` — ASP accepted; subscription is active and service starts for the Buyer.
+/// `sub_created` — ASP accepted; service starts for the Buyer.
 pub fn sub_created_user_notify(
     job_id: &str,
     service_name: &str,
@@ -545,7 +553,7 @@ pub fn sub_created_user_notify(
     auto_renew: bool,
 ) -> String {
     let mut out = format!(
-        "[Subscribed] Job {job_id} (subscribing to {service_name}) is on-chain, status: Active"
+        "[Subscribed] Job {job_id} (subscribing to {service_name}) is on-chain"
     );
     if let (Some(s), Some(e)) = (fmt_epoch(period_start), fmt_epoch(period_end)) {
         out.push_str(&format!(", current period {s}–{e}"));
@@ -585,7 +593,7 @@ pub fn sub_created_trial_user_notify(
     trial_start: Option<i64>,
     trial_end: Option<i64>,
 ) -> String {
-    let mut out = String::from("[Trial Started] Your free trial is active");
+    let mut out = String::from("[Trial Started] Your free trial has started");
     if let (Some(s), Some(e)) = (fmt_epoch(trial_start), fmt_epoch(trial_end)) {
         out.push_str(&format!(" ({s}\u{2013}{e})"));
     }
@@ -610,7 +618,7 @@ pub fn sub_created_trial_user_notify(
 
 /// `sub_trial_into_active` — free trial ended, first real charge taken (user).
 pub fn sub_trial_into_active_user_notify(
-    job_id: &str,
+    _job_id: &str,
     service_name: &str,
     token_amount: Option<&str>,
     token_symbol: Option<&str>,
@@ -634,7 +642,6 @@ pub fn sub_trial_into_active_user_notify(
         out.push_str(&format!(", current period {s}–{e}"));
     }
     out.push('.');
-    out.push_str(&format!(" Job {job_id} status: Active."));
     // `nextChargeAt` = `periodEnd` = `subEndTime`; render from `period_end`, omit if absent.
     if let Some(nc) = fmt_epoch(period_end) {
         out.push_str(&format!(" Next charge date: {nc}."));
@@ -651,7 +658,7 @@ pub fn sub_renew_user_notify(
     renew_result: Option<&str>,
     fail_reason: Option<&str>,
     service_name: &str,
-    job_id: &str,
+    _job_id: &str,
     token_amount: Option<&str>,
     token_symbol: Option<&str>,
     _period_start: Option<i64>,
@@ -684,7 +691,6 @@ pub fn sub_renew_user_notify(
             _ => out.push_str(" this cycle's renewal is complete."),
         }
         // Renewal keeps the same billing cycle; the period range is intentionally not repeated here.
-        out.push_str(&format!(" Job {job_id} status: Active"));
         // `nextChargeAt` = `periodEnd` = `subEndTime`; render from `period_end`, omit if absent.
         if let Some(nc) = fmt_epoch(period_end) {
             out.push_str(&format!(". Next charge date: {nc}."));
@@ -1199,6 +1205,47 @@ mod tests {
         );
     }
 
+    // ── T2: job_accepted_escrow_user_notify zero-amount → `Amount: Free` ──
+    // Assert on the `Amount:` line only (not the trailing sentence), so the
+    // tests stay deterministic regardless of `is_cli_mode()`.
+
+    #[test]
+    fn native_job_accepted_zero_shows_free() {
+        let out = job_accepted_escrow_user_notify("job-1", "Title", "0");
+        assert!(out.contains("Amount: Free"), "{out}");
+        assert!(!out.contains("<tokenAmount>"), "{out}");
+    }
+
+    #[test]
+    fn native_job_accepted_positive_shows_placeholder() {
+        let out = job_accepted_escrow_user_notify("job-1", "Title", "1.5");
+        assert!(out.contains("Amount: <tokenAmount> <tokenSymbol>"), "{out}");
+    }
+
+    #[test]
+    fn native_job_accepted_empty_shows_placeholder() {
+        let out = job_accepted_escrow_user_notify("job-1", "Title", "");
+        assert!(out.contains("Amount: <tokenAmount> <tokenSymbol>"), "{out}");
+    }
+
+    #[test]
+    fn native_job_accepted_zero_fraction_shows_free() {
+        let out = job_accepted_escrow_user_notify("job-1", "Title", "0.000000");
+        assert!(out.contains("Amount: Free"), "{out}");
+        assert!(!out.contains("<tokenAmount>"), "{out}");
+    }
+
+    #[test]
+    fn native_job_accepted_unparsable_shows_placeholder() {
+        for amount in ["abc", "-0"] {
+            let out = job_accepted_escrow_user_notify("job-1", "Title", amount);
+            assert!(
+                out.contains("Amount: <tokenAmount> <tokenSymbol>"),
+                "{amount} → {out}"
+            );
+        }
+    }
+
     #[test]
     fn scoped_watch_handoff_requires_nonterminal_reentry() {
         let out = scoped_watch_handoff("job-123");
@@ -1288,7 +1335,7 @@ mod tests {
     }
 
     #[test]
-    fn sub_created_renders_active_and_first_charge_verbatim() {
+    fn sub_created_renders_subscription_confirmation_and_first_charge_verbatim() {
         let out = sub_created_user_notify(
             "job-1",
             "My Sub",
@@ -1301,7 +1348,8 @@ mod tests {
         assert!(out.starts_with("[Subscribed]"), "canonical prefix: {out}");
         assert!(out.contains("Job job-1"));
         assert!(out.contains("subscribing to My Sub"));
-        assert!(out.contains("status: Active"));
+        assert!(!out.contains("status:"));
+        assert!(!out.contains("Active"));
         assert!(out.contains("current period"));
         assert!(
             out.contains("First charge of 1.500000 USDT completed"),
@@ -1317,21 +1365,23 @@ mod tests {
     }
 
     #[test]
-    fn sub_open_paid_is_created_but_not_active() {
+    fn sub_open_paid_confirms_funding_without_activation_copy() {
         let out = sub_open_user_notify("job-1", "My Sub", Some("1.5"), Some("USDT"));
         assert!(out.starts_with("[Subscription Created]"));
         assert!(out.contains("waiting for the ASP to accept"));
         assert!(out.contains("1.5 USDT has been funded"));
-        assert!(out.contains("not active yet"));
+        assert!(!out.contains("active"));
+        assert!(!out.contains("activation"));
         assert!(!out.contains("First charge"));
     }
 
     #[test]
-    fn sub_open_trial_does_not_claim_trial_started() {
+    fn sub_open_trial_explains_acceptance_without_activation_copy() {
         let out = sub_open_trial_user_notify("job-1", "My Sub", Some("1.5"), Some("USDT"));
         assert!(out.starts_with("[Trial Subscription Created]"));
         assert!(out.contains("waiting for the ASP to accept"));
-        assert!(out.contains("free trial has not started yet"));
+        assert!(out.contains("free trial will begin after acceptance"));
+        assert!(!out.contains("active"));
         assert!(out.contains("1.5 USDT is the paid-period price"));
         assert!(!out.contains("Trial Started"));
     }
@@ -1391,7 +1441,7 @@ mod tests {
         );
         assert!(out.starts_with("[Trial Started]"), "trial prefix: {out}");
         assert!(
-            out.contains("Your free trial is active ("),
+            out.contains("Your free trial has started ("),
             "date range rendered: {out}"
         );
         assert!(
@@ -1414,7 +1464,7 @@ mod tests {
     fn sub_created_trial_degrades_without_amount_or_dates() {
         let bare = sub_created_trial_user_notify("job-1", None, None, None, None);
         assert!(
-            bare.starts_with("[Trial Started] Your free trial is active."),
+            bare.starts_with("[Trial Started] Your free trial has started."),
             "no amount → whole conversion sentence omitted; no dates → no range: {bare}"
         );
         assert!(bare.contains("reply \"Rate job\""));
@@ -1442,7 +1492,8 @@ mod tests {
             out.contains("current period"),
             "period range present: {out}"
         );
-        assert!(out.contains("Job job-1 status: Active."));
+        assert!(!out.contains("status:"));
+        assert!(!out.contains("Active"));
         assert!(
             out.contains("Next charge date:"),
             "nextChargeAt = subEndTime: {out}"
@@ -1459,11 +1510,12 @@ mod tests {
         assert!(bare.contains("first charge of 2.00 USDT for \"My Sub\" is complete."));
         assert!(!bare.contains("current period"));
         assert!(!bare.contains("Next charge date"));
-        assert!(bare.contains("Job job-1 status: Active."));
+        assert!(!bare.contains("status:"));
+        assert!(!bare.contains("Active"));
     }
 
     #[test]
-    fn sub_renew_success_renders_active_and_conditional_next() {
+    fn sub_renew_success_renders_confirmation_and_conditional_next() {
         // Period fields absent → no New period / Next charge date clause.
         let bare = sub_renew_user_notify(
             Some("success"),
@@ -1478,7 +1530,8 @@ mod tests {
         );
         assert!(bare.starts_with("[Renewed]"));
         assert!(bare.contains("this cycle's renewal of 1.00 USDT is complete"));
-        assert!(bare.contains("Job job-1 status: Active."));
+        assert!(!bare.contains("status:"));
+        assert!(!bare.contains("Active"));
         assert!(!bare.contains("New period"), "period absent → omitted");
         assert!(
             !bare.contains("Next charge date"),

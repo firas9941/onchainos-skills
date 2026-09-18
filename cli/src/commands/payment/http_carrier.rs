@@ -84,9 +84,8 @@ pub fn build_request(
     if !query.is_empty() {
         rb = rb.query(&query);
     }
-    // Only body-bearing methods carry a JSON body; body-tagged params on a GET
-    // are dropped rather than silently converted (an intentional no-op we treat
-    // as a merchant-schema inconsistency, not a fund-safety issue).
+    // Generic payment requests retain their declared carrier behavior. The
+    // A2MCP-specific empty JSON POST rule lives in `build_typed_request` below.
     if body_bearing && !body.is_empty() {
         rb = rb.json(&Value::Object(body));
     }
@@ -151,7 +150,9 @@ pub fn build_typed_request(
     if !query.is_empty() {
         request = request.query(&query);
     }
-    if !body.is_empty() {
+    // The GET -> POST probe fallback must remain a valid JSON request even when
+    // there are no business parameters.
+    if body_bearing && (!body.is_empty() || method.eq_ignore_ascii_case("POST")) {
         request = request.json(&Value::Object(body));
     }
     for (key, value) in headers {
@@ -249,6 +250,63 @@ mod tests {
         assert_eq!(body["count"], serde_json::json!(2));
         assert_eq!(body["enabled"], serde_json::json!(true));
         assert_eq!(body["filter"], serde_json::json!({"kind":"book"}));
+    }
+
+    #[test]
+    fn empty_post_requests_send_json_object_and_content_type() {
+        let client = reqwest::Client::new();
+
+        let request = build_typed_request(
+            &client,
+            "POST",
+            "https://example.com/probe",
+            &Map::new(),
+            &[],
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+
+        assert_eq!(
+            request.headers()[reqwest::header::CONTENT_TYPE],
+            "application/json"
+        );
+        assert_eq!(request.body().unwrap().as_bytes().unwrap(), b"{}");
+    }
+
+    #[test]
+    fn generic_empty_post_keeps_existing_bodyless_behavior() {
+        let client = reqwest::Client::new();
+        let request = build_request(&client, "POST", "https://example.com/pay", &[], &[])
+            .build()
+            .unwrap();
+
+        assert!(request.body().is_none());
+        assert!(!request
+            .headers()
+            .contains_key(reqwest::header::CONTENT_TYPE));
+    }
+
+    #[test]
+    fn post_with_non_body_plan_still_sends_empty_json_document() {
+        let client = reqwest::Client::new();
+        let plan = vec![spec("tenant", ParamCarrier::Header)];
+        let request = build_typed_request(
+            &client,
+            "POST",
+            "https://example.com/probe",
+            &Map::new(),
+            &plan,
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+
+        assert_eq!(
+            request.headers()[reqwest::header::CONTENT_TYPE],
+            "application/json"
+        );
+        assert_eq!(request.body().unwrap().as_bytes().unwrap(), b"{}");
     }
 
     #[test]

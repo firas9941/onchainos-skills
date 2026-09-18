@@ -11,9 +11,10 @@ use super::{
     normalize_a2mcp_method, normalize_invocation_result, outstanding_input,
     outstanding_request_input, parse_probe_input, payment_ready_decision, post_verification_action,
     resolve_request_method, run_confirm_free, run_probe, run_resume_after_funding,
+    send_initial_probe, should_retry_default_get_after_failure,
     should_verify_default_get_challenge_with_post, to_payment_param_plan, A2mcpProbeCommand,
     Action, ConfirmFreeArgs, FieldConstraint, HttpOutcome, PostVerificationAction, ProbeArgs,
-    ProbeDecision, ResumeAfterFundingArgs,
+    ProbeDecision, ProbeInput, ResumeAfterFundingArgs, ServiceSnapshot,
 };
 
 #[derive(Parser)]
@@ -317,22 +318,123 @@ fn request_method_resolution_rejects_mismatched_declared_path_and_defaults_missi
 }
 
 #[test]
-fn method_error_fallback_switches_once_between_get_and_post() {
+fn method_error_fallback_uses_allow_evidence_for_post_to_get() {
     assert_eq!(
         fallback_method_for_405("GET", None).as_deref(),
         Some("POST")
     );
-    assert_eq!(
-        fallback_method_for_405("POST", None).as_deref(),
-        Some("GET")
-    );
+    assert_eq!(fallback_method_for_405("POST", None), None);
 
     assert_eq!(
         fallback_method_for_405("GET", Some("POST, OPTIONS")).as_deref(),
         Some("POST")
     );
     assert_eq!(fallback_method_for_405("GET", Some("GET")), None);
+    assert_eq!(
+        fallback_method_for_405("POST", Some("GET, OPTIONS")).as_deref(),
+        Some("GET")
+    );
     assert_eq!(fallback_method_for_405("POST", Some("POST")), None);
+}
+
+#[test]
+fn broad_failure_fallback_applies_only_to_defaulted_get() {
+    let explicit = parse_probe_input(&routing_payload().to_string(), "{}").unwrap();
+    assert!(!should_retry_default_get_after_failure(&explicit));
+
+    let mut routing = routing_payload();
+    routing.as_object_mut().unwrap().remove("requestSpec");
+    let defaulted = parse_probe_input(&routing.to_string(), "{}").unwrap();
+    assert!(should_retry_default_get_after_failure(&defaulted));
+}
+
+#[tokio::test]
+async fn default_get_transport_failure_retries_once_with_empty_json_post() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint =
+        url::Url::parse(&format!("http://{}/probe", listener.local_addr().unwrap())).unwrap();
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let server_captured = Arc::clone(&captured);
+    let server = std::thread::spawn(move || {
+        for attempt in 0..2 {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            loop {
+                let read = stream.read(&mut chunk).unwrap_or(0);
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                let text = String::from_utf8_lossy(&request);
+                let Some((headers, body)) = text.split_once("\r\n\r\n") else {
+                    continue;
+                };
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                if body.len() >= content_length {
+                    break;
+                }
+            }
+            server_captured
+                .lock()
+                .unwrap()
+                .push(String::from_utf8_lossy(&request).into_owned());
+            if attempt == 0 {
+                continue;
+            }
+            let response_body = r#"{"ok":true}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                response_body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        }
+    });
+
+    let mut input = ProbeInput {
+        snapshot: ServiceSnapshot {
+            raw: json!({}),
+            service_id: "service-1".into(),
+            service_name: None,
+            provider_agent_id: None,
+            endpoint,
+            method: "GET".into(),
+            method_was_defaulted: true,
+            asp_amount: None,
+            asp_symbol: None,
+            param_plan: Vec::new(),
+            required_any_of: Vec::new(),
+        },
+        typed_params: serde_json::Map::new(),
+    };
+
+    let outcome = send_initial_probe(&mut input).await.unwrap();
+    server.join().unwrap();
+    assert!(matches!(outcome, HttpOutcome::Free { status: 200, .. }));
+    assert_eq!(input.snapshot.method, "POST");
+
+    let requests = captured.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].starts_with("GET /probe"));
+    assert!(requests[1].starts_with("POST /probe"));
+    assert!(requests[1]
+        .to_ascii_lowercase()
+        .contains("content-type: application/json"));
+    assert!(requests[1].ends_with("\r\n\r\n{}"));
 }
 
 #[test]

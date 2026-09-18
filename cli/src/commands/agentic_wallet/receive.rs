@@ -46,7 +46,7 @@ pub(super) async fn cmd_receive(
                 bail!("wallet receive could not resolve the supported-chain search scope");
             }
             let chain_names = supported_chain_names(&chains);
-            let mut client = ApiClient::new_async(None).await?;
+            let mut client = ApiClient::new_async().await?;
             let raw = crate::commands::token::fetch_search(
                 &mut client,
                 query,

@@ -11,11 +11,11 @@ done
 script_dir="$(cd -P -- "$(dirname -- "$script_source")" && pwd)"
 # shellcheck source=common.sh
 source "$script_dir/common.sh"
-load_dev_config
+load_dev_runtime
 
 real_a2a="$dev_repo_root/.codex/bin/okx-a2a.real"
 [[ -x "$real_a2a" ]] || {
-  echo "error: global okx-a2a is unavailable; run npm run dev:init" >&2
+  echo "error: global okx-a2a is unavailable; run npm run setup" >&2
   exit 1
 }
 

@@ -19,8 +19,8 @@ fn agent_commerce_headers(agent_id: &str) -> [(&str, &str); 1] {
     [("agenticId", agent_id)]
 }
 
-fn wallet_client(ctx: &CliContext) -> Result<WalletApiClient> {
-    WalletApiClient::with_base_url(ctx.base_url_override.as_deref())
+fn wallet_client(_ctx: &CliContext) -> Result<WalletApiClient> {
+    WalletApiClient::new()
 }
 
 /// Internal dispatch enum for chat commands — reshaped from `AgentCommand` variants.

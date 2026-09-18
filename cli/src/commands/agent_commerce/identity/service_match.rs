@@ -30,6 +30,7 @@ pub async fn service_match(args: ServiceMatchArgs, ctx: &Context) -> Result<()> 
             &GetMyAgentsArgs {
                 role: Some("user".to_string()),
                 owner_address: None,
+                agent_ids: None,
                 page: None,
                 page_size: None,
             },

@@ -776,11 +776,6 @@ mod tests {
         assert_eq!(BATCH_SIZE, 50);
     }
 
-    #[test]
-    fn default_base_url_is_beta() {
-        assert_eq!(crate::client::DEFAULT_BASE_URL, "https://web3.okx.com");
-    }
-
     // ── token format parsing (mirrors token_scan_explicit closure logic) ──────
 
     fn parse_token(item: &str) -> Result<(String, String)> {

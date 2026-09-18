@@ -185,7 +185,7 @@ pub(crate) async fn ensure_tokens_refreshed() -> Result<String> {
         }
     };
 
-    // ── Step 3: refresh_token expired → prompt + try AK re-login ────
+    // ── Step 3: refresh_token expired → require a new login ─────────
     if cfg!(feature = "debug-log") {
         let now_ts = chrono::Utc::now().timestamp();
         if let Some(exp_ts) = token_exp_timestamp(&refresh_token) {
@@ -347,12 +347,9 @@ pub(crate) fn format_api_error(e: anyhow::Error) -> anyhow::Error {
 /// Path of the social-login page, joined onto the effective base URL.
 const SOCIAL_LOGIN_PATH: &str = "/account/sociallogin";
 
-/// Effective base URL for the login page (same resolution as `WalletApiClient`).
-fn social_login_base_url() -> String {
-    std::env::var("OKX_BASE_URL")
-        .ok()
-        .or_else(|| option_env!("OKX_BASE_URL").map(|s| s.to_string()))
-        .unwrap_or_else(|| crate::client::DEFAULT_BASE_URL.to_string())
+/// Effective base URL for the login page.
+fn social_login_base_url() -> &'static str {
+    crate::endpoints::base_url()
 }
 
 /// Build the login-page URL
@@ -1383,7 +1380,7 @@ mod tests {
                 .expect("write heartbeat response");
         });
 
-        let mut client = WalletApiClient::with_base_url(Some(&format!("http://{address}")))
+        let mut client = WalletApiClient::new_for_test(&format!("http://{address}"))
             .expect("build heartbeat client");
         let snapshot = run_post_login_setup(
             &mut client,

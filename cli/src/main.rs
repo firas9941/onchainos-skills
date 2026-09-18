@@ -9,6 +9,7 @@ mod config;
 pub mod crypto;
 mod device;
 mod doh;
+mod endpoints;
 mod file_keyring;
 mod funding;
 mod home;
@@ -38,9 +39,9 @@ use clap::{Parser, Subcommand};
     about = "onchainOS CLI - interact with OKX Web3 backend"
 )]
 pub struct Cli {
-    /// Backend service URL (overrides config)
-    #[arg(long, global = true)]
-    pub base_url: Option<String>,
+    /// Use the internal development API endpoint.
+    #[arg(long, global = true, hide = true)]
+    pub dev: bool,
 
     /// Chain: ethereum, solana, base, bsc, polygon, arbitrum, sui, etc.
     #[arg(long, global = true)]
@@ -104,11 +105,7 @@ pub enum Commands {
         command: commands::portfolio::PortfolioCommand,
     },
     /// Start as MCP server (JSON-RPC 2.0 over stdio)
-    Mcp {
-        /// Backend service URL override
-        #[arg(long)]
-        base_url: Option<String>,
-    },
+    Mcp,
     /// Agentic wallet: accounts, balances, transfers, UTXOs, contract calls, and history
     Wallet {
         #[command(subcommand)]
@@ -177,13 +174,12 @@ fn main() {
 
 #[tokio::main]
 async fn run() {
-    dotenvy::dotenv().ok();
-
     if let Err(e) = crate::home::self_heal_permissions() {
         eprintln!("Warning: {e}");
     }
 
     let mut cli = Cli::parse();
+    endpoints::set_dev_mode(cli.dev);
 
     // The agent subsystem runs only on XLayer (chainId=196, chain name "xlayer").
     // `--chain` is a top-level global flag, and clap 4 has no clean way to hide
@@ -196,18 +192,11 @@ async fn run() {
         cli.chain = Some("xlayer".to_string());
     }
 
-    // Propagate --base-url to env so WalletApiClient and the token-refresh path pick it up.
-    if let Some(ref url) = cli.base_url {
-        std::env::set_var("OKX_BASE_URL", url);
-    }
-
     // MCP server runs indefinitely — skip audit for it (MCP tools log individually).
-    if matches!(cli.command, Commands::Mcp { .. }) {
-        if let Commands::Mcp { base_url } = cli.command {
-            if let Err(e) = mcp::serve(base_url.as_deref()).await {
-                output::error(&format!("{e:#}"));
-                std::process::exit(1);
-            }
+    if matches!(cli.command, Commands::Mcp) {
+        if let Err(e) = mcp::serve().await {
+            output::error(&format!("{e:#}"));
+            std::process::exit(1);
         }
         return;
     }
@@ -231,7 +220,7 @@ async fn run() {
         Commands::CrossChain { command } => commands::cross_chain::execute(&ctx, command).await,
         Commands::Gateway { command } => commands::gateway::execute(&ctx, command).await,
         Commands::Portfolio { command } => commands::portfolio::execute(&ctx, command).await,
-        Commands::Mcp { .. } => unreachable!("handled above"),
+        Commands::Mcp => unreachable!("handled above"),
         Commands::Wallet { command } => commands::agentic_wallet::execute(command).await,
         Commands::Security { command } => commands::security::execute(&ctx, command).await,
         Commands::Payment { command } => commands::payment::execute(command).await,

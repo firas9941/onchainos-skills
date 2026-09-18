@@ -38,7 +38,7 @@ pub enum AgentCommand {
     #[command(name = "get", hide = true)]
     Get(identity::GetArgs),
 
-    /// List your own Agents (optional --role / --owner-address filters)
+    /// List your own Agents (optional --role / --owner-address / --agent-ids filters)
     #[command(name = "get-my-agents")]
     GetMyAgents(identity::GetMyAgentsArgs),
 
@@ -3502,7 +3502,6 @@ mod auto_consent_permit_tests {
         std::env::set_var("ONCHAINOS_HOME", &dir);
         let ctx = crate::commands::Context {
             config: crate::config::AppConfig::default(),
-            base_url_override: None,
             chain_override: None,
         };
 

@@ -141,7 +141,7 @@ pub struct VerifyResponse {
     pub refresh_token: String,
     pub access_token: String,
     /// SA TEE id used by the strategy `createOrder` `verifySignInfo.teeId`.
-    /// `#[serde(default)]`: not every login flow (AK / refresh) returns it.
+    /// `#[serde(default)]`: not every login or refresh flow returns it.
     #[serde(default)]
     pub sa_tee_id: String,
     pub session_cert: String,
@@ -764,23 +764,19 @@ fn unwrap_wallet_envelope(http_status: u16, body: &Value) -> Result<Value> {
 
 impl WalletApiClient {
     pub fn new() -> Result<Self> {
-        Self::with_base_url(None)
+        Self::build(
+            crate::endpoints::base_url(),
+            crate::endpoints::base_url_is_custom(),
+        )
     }
 
-    pub fn with_base_url(base_url_override: Option<&str>) -> Result<Self> {
-        // Same precedence and custom detection as ApiClient::new: an explicit
-        // CLI --base-url beats the OKX_BASE_URL env var, and either one counts
-        // as custom so DoH never swaps a user-chosen host for a proxy node.
-        let base_url = base_url_override
-            .map(|s| s.to_string())
-            .or_else(|| std::env::var("OKX_BASE_URL").ok())
-            .or_else(|| option_env!("OKX_BASE_URL").map(|s| s.to_string()))
-            .unwrap_or_else(|| crate::client::DEFAULT_BASE_URL.to_string());
+    #[cfg(test)]
+    pub(crate) fn new_for_test(base_url: &str) -> Result<Self> {
+        Self::build(base_url, true)
+    }
 
-        let custom = base_url_override.is_some()
-            || std::env::var("OKX_BASE_URL").is_ok()
-            || option_env!("OKX_BASE_URL").is_some();
-        let mut doh = DohManager::new("web3.okx.com", &base_url, custom);
+    fn build(base_url: &str, custom_base_url: bool) -> Result<Self> {
+        let mut doh = DohManager::new(crate::endpoints::API_HOST, base_url, custom_base_url);
         doh.prepare()?;
 
         let mut builder = Client::builder().timeout(std::time::Duration::from_secs(30));
@@ -791,7 +787,7 @@ impl WalletApiClient {
 
         Ok(Self {
             http: builder.build()?,
-            base_url,
+            base_url: base_url.to_string(),
             doh,
         })
     }
@@ -2029,7 +2025,7 @@ mod tests {
 
     #[test]
     fn parse_verify_response_without_sa_tee_id_defaults_empty() {
-        // Not every flow returns `saTeeId` (AK / refresh); `#[serde(default)]`
+        // Not every login or refresh flow returns `saTeeId`; `#[serde(default)]`
         // must keep parsing and leave it empty rather than erroring.
         let json = r#"{
             "refreshToken": "rt",
@@ -2423,9 +2419,7 @@ mod tests {
             let _ = stream.write_all(body);
         });
 
-        // 隔离环境变量：OKX_BASE_URL 优先级最高，测试时要清掉
-        std::env::remove_var("OKX_BASE_URL");
-        let client = WalletApiClient::with_base_url(Some(&format!("http://127.0.0.1:{port}")))
+        let client = WalletApiClient::new_for_test(&format!("http://127.0.0.1:{port}"))
             .expect("build client");
         let boundary = "----test-boundary-xyz";
         let body = format!(

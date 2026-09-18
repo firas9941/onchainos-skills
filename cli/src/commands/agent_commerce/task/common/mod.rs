@@ -1267,8 +1267,7 @@ async fn run_context(job_id: &str, role: &str, agent_id: &str) -> Result<()> {
         bail!("--agent-id is required (beta backend requires non-empty agenticId header)");
     }
 
-    // Fetch task details from the backend. The base url is resolved internally by TaskApiClient::new
-    // via OKX_BASE_URL env > TASK_BASE_URL env > constant fallback; the CLI does not specify it explicitly.
+    // Fetch task details from the effective OKX API endpoint.
     let mut client = network::task_api_client::TaskApiClient::new();
     let resp_val = client
         .get_with_identity(&client.task_path(job_id), agent_id)

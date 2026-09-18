@@ -146,6 +146,18 @@ fn activate_guide_consent(job_id: &str) -> Result<()> {
     super::super::common::autotrade::guide::activate_prepared_consent(job_id)
 }
 
+fn require_subscription_execution_mode(
+    user_agent_id: &str,
+    service_id: &str,
+) -> Result<super::super::common::autotrade::subscription_config::ExecutionMode> {
+    super::super::common::autotrade::subscription_config::execution_mode(user_agent_id, service_id)?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "subscription execution configuration is required; based on the Service Guide, save signal_only for pure signals or guide_direct for automatic copy-trading before create-subscribe"
+            )
+        })
+}
+
 fn build_duplicate_subscription_block(
     service_id: &str,
     existing: &super::subscription_ops::ExistingSubscriptionSummary,
@@ -191,15 +203,7 @@ pub async fn handle_create_subscribe(
         eprintln!("[create-subscribe] user identity check passed (agentId: {user_agent_id})");
     }
 
-    let execution_mode = super::super::common::autotrade::subscription_config::execution_mode(
-        &user_agent_id,
-        &params.service_id,
-    )?
-    .ok_or_else(|| {
-        anyhow::anyhow!(
-            "subscription automatic-copy preference is required; collect the user's Guide answers and save the preference before create-subscribe"
-        )
-    })?;
+    let execution_mode = require_subscription_execution_mode(&user_agent_id, &params.service_id)?;
     if execution_mode
         == super::super::common::autotrade::subscription_config::ExecutionMode::GuideDirect
         && guide_consent.is_none()
@@ -779,6 +783,47 @@ mod tests {
             format: "json".to_string(),
         };
         assert!(params.validate().is_ok());
+    }
+
+    #[test]
+    fn missing_subscription_execution_config_blocks_create_until_agent_classifies_guide() {
+        let _lock = crate::home::TEST_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test_tmp")
+            .join("create_subscribe_signal_only_default");
+        if home.exists() {
+            std::fs::remove_dir_all(&home).ok();
+        }
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("ONCHAINOS_HOME", &home);
+
+        let error = require_subscription_execution_mode("agent-1", "svc-signal-only")
+            .expect_err("missing config must block create-subscribe");
+        assert!(
+            error
+                .to_string()
+                .contains("subscription execution configuration is required"),
+            "unexpected error: {error}"
+        );
+
+        super::super::super::common::autotrade::subscription_config::save_execution_mode(
+            "agent-1",
+            "svc-signal-only",
+            super::super::super::common::autotrade::subscription_config::ExecutionMode::SignalOnly,
+            false,
+        )
+        .unwrap();
+        let mode = require_subscription_execution_mode("agent-1", "svc-signal-only").unwrap();
+        assert_eq!(
+            mode,
+            super::super::super::common::autotrade::subscription_config::ExecutionMode::SignalOnly
+        );
+
+        std::env::remove_var("ONCHAINOS_HOME");
+        std::fs::remove_dir_all(home).ok();
     }
 
     #[test]

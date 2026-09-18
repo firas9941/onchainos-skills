@@ -58,15 +58,14 @@ CLAUDE.local.md
 .codex/runtime/
 .codex/skills/
 .codex/config.toml
-.codex/dev.json
 .cursor
 .ai-mat
 .cursorrules
 .cursorignore
 .claude
 
-# Superpowers generated docs (local only)
-docs/superpowers/
+# Local documentation
+docs/
 
 reports
 
@@ -77,7 +76,6 @@ oli-docs/
 output.md
 .wiki-to-oli-launch.sh
 onboard.md
-docs/agent
 
 # Test artifacts (local only)
 results/
@@ -107,6 +105,7 @@ output/
 
 scripts/dev/*
 !scripts/dev/common.sh
+!scripts/dev/build-onchainos.sh
 !scripts/dev/dev.mjs
 !scripts/dev/dev.test.mjs
 !scripts/dev/okx-a2a.sh

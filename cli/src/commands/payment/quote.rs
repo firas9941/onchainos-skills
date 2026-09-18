@@ -603,7 +603,7 @@ struct DecimalResolver {
 impl DecimalResolver {
     fn new() -> Self {
         Self {
-            client: crate::client::ApiClient::new(None).ok(),
+            client: crate::client::ApiClient::new().ok(),
             memo: HashMap::new(),
         }
     }
@@ -769,7 +769,7 @@ async fn preflight_balances(
         return Some("login_required".to_string());
     };
 
-    let mut client = match crate::client::ApiClient::new(None) {
+    let mut client = match crate::client::ApiClient::new() {
         Ok(c) => c,
         Err(_) => return Some("balance_unavailable".to_string()),
     };

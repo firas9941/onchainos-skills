@@ -3,10 +3,8 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
 use base64::Engine;
-use hmac::{Hmac, Mac};
 use reqwest::Client;
 use serde_json::Value;
-use sha2::Sha256;
 
 use crate::commands::payment::payment_flow::PaymentTier;
 use crate::doh::DohManager;
@@ -14,7 +12,6 @@ use crate::output::CliConfirming;
 use crate::payment_cache::{self, PaymentCache, PaymentDefault};
 use crate::payment_notify::{self, Flag, NotifyInput, TierState, UserType};
 
-pub const DEFAULT_BASE_URL: &str = "https://web3.okx.com";
 const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Market API config endpoint — returns the path→tier `endpointList` map plus
@@ -128,12 +125,6 @@ fn extract_payment_required_accepts(headers: &reqwest::header::HeaderMap) -> Opt
 enum AuthMode {
     /// User is logged in — use JWT Bearer token.
     Jwt(String),
-    /// User is not logged in but AK credentials are available — use HMAC signing.
-    Ak {
-        api_key: String,
-        secret_key: String,
-        passphrase: String,
-    },
     /// No credentials available — send only basic headers (Content-Type, ok-client-version).
     Anonymous,
 }
@@ -212,21 +203,24 @@ fn unwrap_envelope(body: Value) -> Result<Value> {
 }
 
 impl ApiClient {
-    /// Create a client with automatic auth detection:
-    /// 1. JWT from keyring  (user is logged in)
-    /// 2. AK from env vars / ~/.onchainos/.env  (user is not logged in)
-    pub fn new(base_url_override: Option<&str>) -> Result<Self> {
+    /// Create a client with JWT auth when logged in, otherwise anonymous auth.
+    pub fn new() -> Result<Self> {
         let auth = Self::resolve_auth()?;
-        let base_url = base_url_override
-            .map(|s| s.to_string())
-            .or_else(|| std::env::var("OKX_BASE_URL").ok())
-            .or_else(|| option_env!("OKX_BASE_URL").map(|s| s.to_string()))
-            .unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
+        Self::build(
+            auth,
+            crate::endpoints::base_url(),
+            crate::endpoints::base_url_is_custom(),
+        )
+    }
 
-        let custom = base_url_override.is_some()
-            || std::env::var("OKX_BASE_URL").is_ok()
-            || option_env!("OKX_BASE_URL").is_some();
-        let mut doh = DohManager::new("web3.okx.com", &base_url, custom);
+    #[cfg(test)]
+    fn new_for_test(base_url: &str) -> Result<Self> {
+        let auth = Self::resolve_auth()?;
+        Self::build(auth, base_url, true)
+    }
+
+    fn build(auth: AuthMode, base_url: &str, custom_base_url: bool) -> Result<Self> {
+        let mut doh = DohManager::new(crate::endpoints::API_HOST, base_url, custom_base_url);
         doh.prepare()?;
 
         let mut builder = Client::builder().timeout(std::time::Duration::from_secs(10));
@@ -237,7 +231,7 @@ impl ApiClient {
 
         Ok(Self {
             http: builder.build()?,
-            base_url,
+            base_url: base_url.to_string(),
             auth,
             doh,
             payment: Arc::new(Mutex::new(PaymentState::default())),
@@ -247,41 +241,18 @@ impl ApiClient {
     /// Create a client with full JWT lifecycle check:
     /// 1. JWT exists and not expired                → use JWT
     /// 2. JWT expired + refresh token valid         → refresh JWT → use new JWT
-    /// 3. JWT expired + refresh token expired       → prompt user + AK / Anonymous
-    /// 4. No JWT                                    → AK / Anonymous
-    pub async fn new_async(base_url_override: Option<&str>) -> Result<Self> {
+    /// 3. JWT expired + refresh token expired       → prompt user + Anonymous
+    /// 4. No JWT                                    → Anonymous
+    pub async fn new_async() -> Result<Self> {
         let auth = Self::resolve_auth_async().await?;
-        let base_url = base_url_override
-            .map(|s| s.to_string())
-            .or_else(|| std::env::var("OKX_BASE_URL").ok())
-            .or_else(|| option_env!("OKX_BASE_URL").map(|s| s.to_string()))
-            .unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
-
-        let custom = base_url_override.is_some()
-            || std::env::var("OKX_BASE_URL").is_ok()
-            || option_env!("OKX_BASE_URL").is_some();
-        let mut doh = DohManager::new("web3.okx.com", &base_url, custom);
-        doh.prepare()?;
-
-        let mut builder = Client::builder().timeout(std::time::Duration::from_secs(10));
-        if let Some((host, addr)) = doh.resolve_override() {
-            builder = builder.resolve(&host, addr);
-        }
-        builder = builder.user_agent(doh.doh_user_agent());
-
-        Ok(Self {
-            http: builder.build()?,
-            base_url,
+        Self::build(
             auth,
-            doh,
-            payment: Arc::new(Mutex::new(PaymentState::default())),
-        })
+            crate::endpoints::base_url(),
+            crate::endpoints::base_url_is_custom(),
+        )
     }
 
-    /// Resolve authentication mode:
-    /// 1. JWT from keyring (user is logged in)
-    /// 2. AK from env vars / ~/.onchainos/.env (user has configured credentials)
-    /// 3. Anonymous — no credentials, send only basic headers
+    /// Resolve authentication mode from the wallet login session.
     fn resolve_auth() -> Result<AuthMode> {
         // 1. Try JWT from keyring (no expiry check — sync path)
         if let Some(token) = crate::keyring_store::get_opt("access_token") {
@@ -290,7 +261,7 @@ impl ApiClient {
             }
         }
 
-        Self::resolve_ak_or_anonymous()
+        Ok(AuthMode::Anonymous)
     }
 
     /// Full async auth resolution with JWT expiry check and auto-refresh.
@@ -299,7 +270,7 @@ impl ApiClient {
         let access_token = crate::keyring_store::get_opt("access_token").filter(|t| !t.is_empty());
 
         let token = match access_token {
-            None => return Self::resolve_ak_or_anonymous(),
+            None => return Ok(AuthMode::Anonymous),
             Some(t) => t,
         };
 
@@ -313,69 +284,28 @@ impl ApiClient {
             crate::keyring_store::get_opt("refresh_token").filter(|t| !t.is_empty());
 
         let rt = match refresh_token {
-            None => return Self::resolve_ak_or_anonymous(),
+            None => return Ok(AuthMode::Anonymous),
             Some(rt) => rt,
         };
 
         // ── Step 4: refresh token expired → prompt + fallback ────────
         if Self::is_jwt_expired(&rt) {
             eprintln!("Session expired. Please log in again: onchainos wallet login");
-            return Self::resolve_ak_or_anonymous();
+            return Ok(AuthMode::Anonymous);
         }
 
         // ── Step 5: refresh token valid → refresh JWT ────────────────
         // Delegates to the shared force-refresh primitive (DoH-capable) so the
         // refresh logic lives in exactly one place; on failure we fall back to
-        // AK / anonymous just as before.
+        // anonymous access.
         match crate::wallet_api::force_refresh_access_token().await {
             Ok(new_token) => Ok(AuthMode::Jwt(new_token)),
             Err(e) => {
                 eprintln!(
-                    "Failed to refresh session ({}). Falling back to API key auth.",
+                    "Failed to refresh session ({}). Falling back to anonymous access.",
                     e
                 );
-                Self::resolve_ak_or_anonymous()
-            }
-        }
-    }
-
-    /// Shared AK / Anonymous resolution used by both sync and async paths.
-    fn resolve_ak_or_anonymous() -> Result<AuthMode> {
-        // Load ~/.onchainos/.env if AK not yet in env
-        if std::env::var("OKX_API_KEY").is_err() && std::env::var("OKX_ACCESS_KEY").is_err() {
-            if let Ok(home) = crate::home::onchainos_home() {
-                let env_path = home.join(".env");
-                if env_path.exists() {
-                    dotenvy::from_path(env_path).ok();
-                }
-            }
-        }
-
-        let api_key = std::env::var("OKX_API_KEY")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .or_else(|| {
-                std::env::var("OKX_ACCESS_KEY")
-                    .ok()
-                    .filter(|s| !s.is_empty())
-            });
-
-        match api_key {
-            None => Ok(AuthMode::Anonymous),
-            Some(key) => {
-                let secret_key = std::env::var("OKX_SECRET_KEY")
-                    .ok()
-                    .filter(|s| !s.is_empty())
-                    .ok_or_else(|| anyhow::anyhow!("OKX_SECRET_KEY is required but not set"))?;
-                let passphrase = std::env::var("OKX_PASSPHRASE")
-                    .ok()
-                    .filter(|s| !s.is_empty())
-                    .ok_or_else(|| anyhow::anyhow!("OKX_PASSPHRASE is required but not set"))?;
-                Ok(AuthMode::Ak {
-                    api_key: key,
-                    secret_key,
-                    passphrase,
-                })
+                Ok(AuthMode::Anonymous)
             }
         }
     }
@@ -398,21 +328,6 @@ impl ApiClient {
         Self::jwt_exp_timestamp(token)
             .map(|exp| chrono::Utc::now().timestamp() >= exp)
             .unwrap_or(true)
-    }
-
-    /// HMAC-SHA256 signature for AK auth.
-    fn hmac_sign(
-        secret_key: &str,
-        timestamp: &str,
-        method: &str,
-        request_path: &str,
-        body: &str,
-    ) -> String {
-        let prehash = format!("{}{}{}{}", timestamp, method, request_path, body);
-        let mut mac = Hmac::<Sha256>::new_from_slice(secret_key.as_bytes())
-            .expect("HMAC accepts any key length");
-        mac.update(prehash.as_bytes());
-        base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
     }
 
     /// Build the base header map shared by all auth modes.
@@ -469,40 +384,6 @@ impl ApiClient {
         map
     }
 
-    /// Build the header map for AK signing auth (not-logged-in state).
-    /// Extends anonymous_headers with AK signing fields.
-    ///
-    /// Additional headers:
-    /// - `OK-ACCESS-KEY / OK-ACCESS-SIGN / OK-ACCESS-PASSPHRASE / OK-ACCESS-TIMESTAMP`
-    /// - `ok-client-type: cli`
-    pub(crate) fn ak_headers(
-        api_key: &str,
-        passphrase: &str,
-        timestamp: &str,
-        sign: &str,
-    ) -> reqwest::header::HeaderMap {
-        use reqwest::header::HeaderValue;
-        let mut map = Self::anonymous_headers();
-        map.insert(
-            "OK-ACCESS-KEY",
-            HeaderValue::from_str(api_key).expect("valid header value"),
-        );
-        map.insert(
-            "OK-ACCESS-SIGN",
-            HeaderValue::from_str(sign).expect("valid header value"),
-        );
-        map.insert(
-            "OK-ACCESS-PASSPHRASE",
-            HeaderValue::from_str(passphrase).expect("valid header value"),
-        );
-        map.insert(
-            "OK-ACCESS-TIMESTAMP",
-            HeaderValue::from_str(timestamp).expect("valid header value"),
-        );
-        map.insert("ok-client-type", HeaderValue::from_static("cli"));
-        map
-    }
-
     /// Apply JWT Bearer auth headers to a request builder (logged-in state).
     fn apply_jwt(builder: reqwest::RequestBuilder, token: &str) -> reqwest::RequestBuilder {
         builder.headers(Self::jwt_headers(token))
@@ -511,17 +392,6 @@ impl ApiClient {
     /// Apply anonymous headers (no credentials available).
     fn apply_anonymous(builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         builder.headers(Self::anonymous_headers())
-    }
-
-    /// Apply AK signing headers to a request builder (not-logged-in state).
-    fn apply_ak(
-        builder: reqwest::RequestBuilder,
-        api_key: &str,
-        passphrase: &str,
-        timestamp: &str,
-        sign: &str,
-    ) -> reqwest::RequestBuilder {
-        builder.headers(Self::ak_headers(api_key, passphrase, timestamp, sign))
     }
 
     fn rebuild_http_client(&mut self) -> Result<()> {
@@ -562,13 +432,13 @@ impl ApiClient {
             .query()
             .map(|query| format!("?{}", query))
             .unwrap_or_default();
-        // request_path uses original path (no proxy host) — used for HMAC signing
+        // Keep the encoded relative path alongside the URL for callers and tests.
         let request_path = format!("{}{}", path, query_string);
 
         Ok((url, request_path))
     }
 
-    /// GET request with automatic auth (JWT or AK).
+    /// GET request with JWT or anonymous auth.
     pub async fn get(&mut self, path: &str, query: &[(&str, &str)]) -> Result<Value> {
         self.get_with_headers(path, query, None).await
     }
@@ -598,7 +468,7 @@ impl ApiClient {
                 // Server-side token invalidation while the local JWT exp
                 // is still in the future: force-refresh, swap our cached auth,
                 // and retry once. Only meaningful when we are actually sending a
-                // JWT (AK / anonymous do not use an access token).
+                // Anonymous requests do not use an access token.
                 if matches!(self.auth, AuthMode::Jwt(_))
                     && crate::wallet_api::is_invalid_token_error(&e)
                 {
@@ -643,20 +513,10 @@ impl ApiClient {
         query: &[(&str, &str)],
         extra_headers: Option<&[(&str, &str)]>,
     ) -> Result<reqwest::Response> {
-        let (url, request_path) = self.build_get_url_and_request_path(path, query)?;
+        let (url, _) = self.build_get_url_and_request_path(path, query)?;
         let req = self.http.get(url);
         let req = match &self.auth {
             AuthMode::Jwt(token) => Self::apply_jwt(req, token),
-            AuthMode::Ak {
-                api_key,
-                secret_key,
-                passphrase,
-            } => {
-                let timestamp =
-                    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-                let sign = Self::hmac_sign(secret_key, &timestamp, "GET", &request_path, "");
-                Self::apply_ak(req, api_key, passphrase, &timestamp, &sign)
-            }
             AuthMode::Anonymous => Self::apply_anonymous(req),
         };
         let req = Self::apply_extra_headers(req, extra_headers);
@@ -672,20 +532,10 @@ impl ApiClient {
         query: &[(&str, &str)],
         extra_headers: Option<&[(&str, &str)]>,
     ) -> Result<Vec<u8>> {
-        let (url, request_path) = self.build_get_url_and_request_path(path, query)?;
+        let (url, _) = self.build_get_url_and_request_path(path, query)?;
         let req = self.http.get(url);
         let req = match &self.auth {
             AuthMode::Jwt(token) => Self::apply_jwt(req, token),
-            AuthMode::Ak {
-                api_key,
-                secret_key,
-                passphrase,
-            } => {
-                let timestamp =
-                    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-                let sign = Self::hmac_sign(secret_key, &timestamp, "GET", &request_path, "");
-                Self::apply_ak(req, api_key, passphrase, &timestamp, &sign)
-            }
             AuthMode::Anonymous => Self::apply_anonymous(req),
         };
         let req = Self::apply_extra_headers(req, extra_headers);
@@ -736,8 +586,7 @@ impl ApiClient {
             .context("failed to read response bytes")
     }
 
-    /// POST request with automatic auth (JWT or AK). Retries after DoH failover.
-    /// Signature uses path only (no query string) + JSON body string.
+    /// POST request with JWT or anonymous auth. Retries after DoH failover.
     pub async fn post(&mut self, path: &str, body: &Value) -> Result<Value> {
         self.post_with_headers(path, body, None).await
     }
@@ -885,16 +734,6 @@ impl ApiClient {
         let req = self.http.post(&url).body(body_str.clone());
         let req = match &self.auth {
             AuthMode::Jwt(token) => Self::apply_jwt(req, token),
-            AuthMode::Ak {
-                api_key,
-                secret_key,
-                passphrase,
-            } => {
-                let timestamp =
-                    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-                let sign = Self::hmac_sign(secret_key, &timestamp, "POST", path, &body_str);
-                Self::apply_ak(req, api_key, passphrase, &timestamp, &sign)
-            }
             AuthMode::Anonymous => Self::apply_anonymous(req),
         };
         let req = Self::apply_extra_headers(req, extra_headers);
@@ -916,9 +755,7 @@ impl ApiClient {
         self.handle_response(path, resp).await
     }
 
-    /// POST multipart form data with automatic auth (JWT or AK).
-    /// Signature uses path only (no query string) with empty body string.
-    ///
+    /// POST multipart form data with JWT or anonymous auth.
     /// Auth headers are built manually without Content-Type because reqwest
     /// must set its own multipart/form-data boundary header automatically.
     pub async fn post_multipart(
@@ -934,16 +771,6 @@ impl ApiClient {
         // the correct multipart/form-data boundary.
         let mut headers = match &self.auth {
             AuthMode::Jwt(token) => Self::jwt_headers(token),
-            AuthMode::Ak {
-                api_key,
-                secret_key,
-                passphrase,
-            } => {
-                let timestamp =
-                    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-                let sign = Self::hmac_sign(secret_key, &timestamp, "POST", path, "");
-                Self::ak_headers(api_key, passphrase, &timestamp, &sign)
-            }
             AuthMode::Anonymous => Self::anonymous_headers(),
         };
         headers.remove(reqwest::header::CONTENT_TYPE);
@@ -983,16 +810,6 @@ impl ApiClient {
 
         let mut headers = match &self.auth {
             AuthMode::Jwt(token) => Self::jwt_headers(token),
-            AuthMode::Ak {
-                api_key,
-                secret_key,
-                passphrase,
-            } => {
-                let timestamp =
-                    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-                let sign = Self::hmac_sign(secret_key, &timestamp, "POST", path, "");
-                Self::ak_headers(api_key, passphrase, &timestamp, &sign)
-            }
             AuthMode::Anonymous => Self::anonymous_headers(),
         };
         headers.remove(reqwest::header::CONTENT_TYPE);
@@ -1253,20 +1070,10 @@ impl ApiClient {
         payment_hdr: Option<&(&'static str, String)>,
     ) -> Result<Value> {
         loop {
-            let (url, request_path) = self.build_get_url_and_request_path(path, query)?;
+            let (url, _) = self.build_get_url_and_request_path(path, query)?;
             let req = self.http.get(url);
             let req = match &self.auth {
                 AuthMode::Jwt(token) => Self::apply_jwt(req, token),
-                AuthMode::Ak {
-                    api_key,
-                    secret_key,
-                    passphrase,
-                } => {
-                    let timestamp =
-                        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-                    let sign = Self::hmac_sign(secret_key, &timestamp, "GET", &request_path, "");
-                    Self::apply_ak(req, api_key, passphrase, &timestamp, &sign)
-                }
                 AuthMode::Anonymous => Self::apply_anonymous(req),
             };
             let req = Self::apply_extra_headers(req, extra_headers);
@@ -1313,16 +1120,6 @@ impl ApiClient {
             let req = self.http.post(&url).body(body_str.clone());
             let req = match &self.auth {
                 AuthMode::Jwt(token) => Self::apply_jwt(req, token),
-                AuthMode::Ak {
-                    api_key,
-                    secret_key,
-                    passphrase,
-                } => {
-                    let timestamp =
-                        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-                    let sign = Self::hmac_sign(secret_key, &timestamp, "POST", path, &body_str);
-                    Self::apply_ak(req, api_key, passphrase, &timestamp, &sign)
-                }
                 AuthMode::Anonymous => Self::apply_anonymous(req),
             };
             let req = Self::apply_extra_headers(req, extra_headers);
@@ -1360,20 +1157,10 @@ impl ApiClient {
         payment_hdr: Option<&(&'static str, String)>,
     ) -> Result<Value> {
         loop {
-            let (url, request_path) = self.build_get_url_and_request_path(path, query)?;
+            let (url, _) = self.build_get_url_and_request_path(path, query)?;
             let req = self.http.get(url);
             let req = match &self.auth {
                 AuthMode::Jwt(token) => Self::apply_jwt(req, token),
-                AuthMode::Ak {
-                    api_key,
-                    secret_key,
-                    passphrase,
-                } => {
-                    let timestamp =
-                        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-                    let sign = Self::hmac_sign(secret_key, &timestamp, "GET", &request_path, "");
-                    Self::apply_ak(req, api_key, passphrase, &timestamp, &sign)
-                }
                 AuthMode::Anonymous => Self::apply_anonymous(req),
             };
             let req = Self::apply_extra_headers(req, extra_headers);
@@ -1415,16 +1202,6 @@ impl ApiClient {
             let req = self.http.post(&url).body(body_str.clone());
             let req = match &self.auth {
                 AuthMode::Jwt(token) => Self::apply_jwt(req, token),
-                AuthMode::Ak {
-                    api_key,
-                    secret_key,
-                    passphrase,
-                } => {
-                    let timestamp =
-                        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-                    let sign = Self::hmac_sign(secret_key, &timestamp, "POST", path, &body_str);
-                    Self::apply_ak(req, api_key, passphrase, &timestamp, &sign)
-                }
                 AuthMode::Anonymous => Self::apply_anonymous(req),
             };
             let req = Self::apply_extra_headers(req, extra_headers);
@@ -1671,7 +1448,7 @@ impl ApiClient {
     /// Full URL for `path`, used as the `resource` field in the V2 payment
     /// header payload.
     ///
-    /// Intentionally uses `self.base_url` (the canonical public origin)
+    /// Intentionally uses `self.base_url` (the compiled logical origin)
     /// rather than `effective_base_url()`. Under DoH failover the client
     /// actually hits a proxy host, but `resource` is the *logical*
     /// identifier the server signs against — it must match the public
@@ -2046,19 +1823,7 @@ mod tests {
     use super::{PaymentCache, PaymentRequired, PaymentTier, TierState};
     use serde_json::Value;
 
-    /// Set AK credential env vars to dummy test values so ApiClient::new() succeeds.
-    fn set_test_credentials() {
-        std::env::set_var("OKX_API_KEY", "test-api-key");
-        std::env::set_var("OKX_SECRET_KEY", "test-secret-key");
-        std::env::set_var("OKX_PASSPHRASE", "test-passphrase");
-    }
-
     // ── constants ─────────────────────────────────────────────────────────────
-
-    #[test]
-    fn default_base_url_is_beta() {
-        assert_eq!(super::DEFAULT_BASE_URL, "https://web3.okx.com");
-    }
 
     #[test]
     fn client_version_matches_cargo() {
@@ -2105,12 +1870,8 @@ mod tests {
     #[test]
     fn platform_header_agent_cli_on_all_modes() {
         // `platform: agent-cli` mirrors `Ok-Access-Client-type`: carried on
-        // every request regardless of auth mode (anonymous / JWT / AK).
-        for h in [
-            ApiClient::anonymous_headers(),
-            ApiClient::jwt_headers("tok"),
-            ApiClient::ak_headers("k", "p", "ts", "s"),
-        ] {
+        // every request regardless of auth mode (anonymous / JWT).
+        for h in [ApiClient::anonymous_headers(), ApiClient::jwt_headers("tok")] {
             assert_eq!(
                 h.get("platform").expect("platform").to_str().unwrap(),
                 "agent-cli"
@@ -2138,95 +1899,6 @@ mod tests {
         assert!(h.get("ok-access-passphrase").is_none());
         assert!(h.get("ok-access-token").is_none());
         assert!(h.get("ok-client-type").is_none());
-    }
-
-    // ── AK headers ───────────────────────────────────────────────────────────
-
-    #[test]
-    fn ak_headers_access_key() {
-        let h = ApiClient::ak_headers("my-key", "pass", "2024-01-01T00:00:00.000Z", "sign123");
-        assert_eq!(
-            h.get("ok-access-key")
-                .expect("ok-access-key")
-                .to_str()
-                .unwrap(),
-            "my-key"
-        );
-    }
-
-    #[test]
-    fn ak_headers_sign_and_passphrase() {
-        let h = ApiClient::ak_headers("key", "my-pass", "ts", "my-sign");
-        assert_eq!(
-            h.get("ok-access-sign")
-                .expect("ok-access-sign")
-                .to_str()
-                .unwrap(),
-            "my-sign"
-        );
-        assert_eq!(
-            h.get("ok-access-passphrase")
-                .expect("ok-access-passphrase")
-                .to_str()
-                .unwrap(),
-            "my-pass"
-        );
-    }
-
-    #[test]
-    fn ak_headers_timestamp() {
-        let ts = "2024-03-15T10:00:00.000Z";
-        let h = ApiClient::ak_headers("k", "p", ts, "s");
-        assert_eq!(
-            h.get("ok-access-timestamp")
-                .expect("ok-access-timestamp")
-                .to_str()
-                .unwrap(),
-            ts
-        );
-    }
-
-    #[test]
-    fn ak_headers_client_type_cli() {
-        let h = ApiClient::ak_headers("k", "p", "ts", "s");
-        assert_eq!(
-            h.get("ok-client-type")
-                .expect("ok-client-type")
-                .to_str()
-                .unwrap(),
-            "cli"
-        );
-    }
-
-    #[test]
-    fn ak_headers_client_version_present() {
-        let h = ApiClient::ak_headers("k", "p", "ts", "s");
-        let v = h
-            .get("ok-client-version")
-            .expect("ok-client-version")
-            .to_str()
-            .unwrap();
-        assert_eq!(v, env!("CARGO_PKG_VERSION"));
-    }
-
-    #[test]
-    fn ak_headers_content_type_json() {
-        let h = ApiClient::ak_headers("k", "p", "ts", "s");
-        assert_eq!(
-            h.get("content-type")
-                .expect("content-type")
-                .to_str()
-                .unwrap(),
-            "application/json"
-        );
-    }
-
-    #[test]
-    fn ak_headers_no_jwt_fields() {
-        let h = ApiClient::ak_headers("k", "p", "ts", "s");
-        assert!(h.get("authorization").is_none());
-        // AK mode shares anonymous_headers base so has Ok-Access-Client-type
-        assert!(h.get("ok-access-client-type").is_some());
     }
 
     // ── anonymous headers / device-id (spec §6.2) ─────────────────────────────
@@ -2333,64 +2005,11 @@ mod tests {
         });
     }
 
-    // ── HMAC sign ─────────────────────────────────────────────────────────────
-
-    #[test]
-    fn hmac_sign_is_deterministic() {
-        let s1 = ApiClient::hmac_sign(
-            "secret",
-            "2024-01-01T00:00:00.000Z",
-            "GET",
-            "/api/v6/test",
-            "",
-        );
-        let s2 = ApiClient::hmac_sign(
-            "secret",
-            "2024-01-01T00:00:00.000Z",
-            "GET",
-            "/api/v6/test",
-            "",
-        );
-        assert_eq!(s1, s2);
-        assert!(!s1.is_empty());
-    }
-
-    #[test]
-    fn hmac_sign_differs_by_method() {
-        let get = ApiClient::hmac_sign("secret", "ts", "GET", "/path", "");
-        let post = ApiClient::hmac_sign("secret", "ts", "POST", "/path", "");
-        assert_ne!(get, post);
-    }
-
-    #[test]
-    fn hmac_sign_differs_by_body() {
-        let empty = ApiClient::hmac_sign("secret", "ts", "POST", "/path", "");
-        let with_body = ApiClient::hmac_sign("secret", "ts", "POST", "/path", r#"{"foo":"bar"}"#);
-        assert_ne!(empty, with_body);
-    }
-
-    #[test]
-    fn hmac_sign_differs_by_secret() {
-        let s1 = ApiClient::hmac_sign("secret-a", "ts", "GET", "/path", "");
-        let s2 = ApiClient::hmac_sign("secret-b", "ts", "GET", "/path", "");
-        assert_ne!(s1, s2);
-    }
-
-    #[test]
-    fn hmac_sign_output_is_base64() {
-        let sign = ApiClient::hmac_sign("key", "ts", "GET", "/path", "");
-        // base64 standard alphabet: A-Z a-z 0-9 + / =
-        assert!(sign
-            .chars()
-            .all(|c| c.is_alphanumeric() || c == '+' || c == '/' || c == '='));
-    }
-
     // ── URL building ─────────────────────────────────────────────────────────
 
     #[test]
     fn build_get_request_path_percent_encodes_query_values() {
-        set_test_credentials();
-        let client = ApiClient::new(None).expect("client");
+        let client = ApiClient::new().expect("client");
         let (_, request_path) = client
             .build_get_url_and_request_path(
                 "/api/v6/dex/market/memepump/tokenList",
@@ -2411,8 +2030,7 @@ mod tests {
 
     #[test]
     fn build_get_request_path_no_query_has_no_question_mark() {
-        set_test_credentials();
-        let client = ApiClient::new(None).expect("client");
+        let client = ApiClient::new().expect("client");
         let (_, request_path) = client
             .build_get_url_and_request_path("/api/v6/dex/token/search", &[])
             .expect("request path");
@@ -2422,25 +2040,13 @@ mod tests {
 
     #[test]
     fn build_get_request_path_filters_empty_values() {
-        set_test_credentials();
-        let client = ApiClient::new(None).expect("client");
+        let client = ApiClient::new().expect("client");
         let (_, request_path) = client
             .build_get_url_and_request_path("/api/test", &[("a", "1"), ("b", ""), ("c", "3")])
             .expect("request path");
         assert!(request_path.contains("a=1"));
         assert!(request_path.contains("c=3"));
         assert!(!request_path.contains("b="));
-    }
-
-    // ── Auth resolution priority (documented) ────────────────────────────────
-    // 1. JWT from keyring (access_token) → AuthMode::Jwt — tested via integration/manual
-    // 2. AK from env vars → AuthMode::Ak  — tested below
-    // 3. No credentials → AuthMode::Anonymous (no error, empty auth headers)
-
-    #[test]
-    fn new_with_ak_credentials_succeeds() {
-        set_test_credentials();
-        assert!(ApiClient::new(None).is_ok());
     }
 
     #[test]
@@ -2469,9 +2075,8 @@ mod tests {
     }
 
     #[test]
-    fn new_respects_base_url_override() {
-        set_test_credentials();
-        let client = ApiClient::new(Some("https://custom.example.com")).expect("client");
+    fn test_client_can_target_a_local_endpoint() {
+        let client = ApiClient::new_for_test("https://custom.example.com").expect("client");
         let (url, _) = client
             .build_get_url_and_request_path("/priapi/v5/wallet/test", &[])
             .expect("url");
@@ -2479,9 +2084,8 @@ mod tests {
     }
 
     #[test]
-    fn dex_paths_respect_base_url_override() {
-        set_test_credentials();
-        let client = ApiClient::new(Some("https://custom.example.com")).expect("client");
+    fn test_client_uses_local_endpoint_for_dex_paths() {
+        let client = ApiClient::new_for_test("https://custom.example.com").expect("client");
         let (url, _) = client
             .build_get_url_and_request_path("/api/v6/dex/market/candles", &[])
             .expect("url");
@@ -2492,8 +2096,7 @@ mod tests {
 
     #[test]
     fn apply_config_response_populates_endpoints_from_endpoint_list() {
-        set_test_credentials();
-        let client = ApiClient::new(None).expect("client");
+        let client = ApiClient::new().expect("client");
         let data = serde_json::json!({
             "endpointList": {
                 "/api/v6/dex/market/trades": "BASIC",
@@ -2525,8 +2128,7 @@ mod tests {
 
     #[test]
     fn apply_config_response_tolerates_missing_endpoint_list() {
-        set_test_credentials();
-        let client = ApiClient::new(None).expect("client");
+        let client = ApiClient::new().expect("client");
         let data = serde_json::json!({});
         client.apply_config_response(&data);
         assert!(client.payment_state().endpoints.is_empty());
@@ -2534,8 +2136,7 @@ mod tests {
 
     #[test]
     fn restore_from_cache_preserves_charging_flags_when_expired() {
-        set_test_credentials();
-        let client = ApiClient::new(None).expect("client");
+        let client = ApiClient::new().expect("client");
         let cache = PaymentCache {
             endpoints: [("/api/v6/dex/market/price".to_string(), "basic".to_string())]
                 .into_iter()
@@ -2562,8 +2163,7 @@ mod tests {
 
     #[test]
     fn restore_from_cache_loads_full_state_when_fresh() {
-        set_test_credentials();
-        let client = ApiClient::new(None).expect("client");
+        let client = ApiClient::new().expect("client");
         let cache = PaymentCache {
             endpoints: [("/api/v6/dex/market/price".to_string(), "basic".to_string())]
                 .into_iter()
@@ -2589,15 +2189,13 @@ mod tests {
 
     #[test]
     fn tier_for_path_returns_none_when_unknown() {
-        set_test_credentials();
-        let client = ApiClient::new(None).expect("client");
+        let client = ApiClient::new().expect("client");
         assert_eq!(client.tier_for_path("/api/v6/dex/market/unknown"), None);
     }
 
     #[test]
     fn consume_pending_confirmation_returns_true_then_clears() {
-        set_test_credentials();
-        let client = ApiClient::new(None).expect("client");
+        let client = ApiClient::new().expect("client");
         // Seed endpoints so the tier lookup succeeds.
         client.apply_config_response(&serde_json::json!({
             "endpointList": { "/api/v6/dex/market/price": "BASIC" },
@@ -2620,8 +2218,7 @@ mod tests {
         // is empty. We should still block confirming based on the pending
         // set alone, otherwise the first paid request signs with the
         // wrong tier and the user never sees the notification.
-        set_test_credentials();
-        let client = ApiClient::new(None).expect("client");
+        let client = ApiClient::new().expect("client");
         client
             .payment_state()
             .pending_over_quota_tiers
@@ -2636,16 +2233,14 @@ mod tests {
 
     #[test]
     fn consume_pending_confirmation_returns_false_when_nothing_pending() {
-        set_test_credentials();
-        let client = ApiClient::new(None).expect("client");
+        let client = ApiClient::new().expect("client");
         // Empty pending set, empty endpoints → nothing to confirm.
         assert!(!client.consume_pending_confirmation("/api/v6/dex/market/whatever"));
     }
 
     #[test]
     fn resolve_retry_accepts_returns_fresh_without_touching_cache() {
-        set_test_credentials();
-        let client = ApiClient::new(None).expect("client");
+        let client = ApiClient::new().expect("client");
         let fresh = serde_json::json!([
             {"scheme":"exact","network":"eip155:196","amount":{"basic":"200"}}
         ]);
@@ -2662,8 +2257,7 @@ mod tests {
 
     #[test]
     fn resolve_retry_accepts_falls_back_to_cached_when_response_empty() {
-        set_test_credentials();
-        let client = ApiClient::new(None).expect("client");
+        let client = ApiClient::new().expect("client");
         let cached = serde_json::json!([
             {"scheme":"exact","network":"eip155:196","amount":{"basic":"100"}}
         ]);
@@ -2679,8 +2273,7 @@ mod tests {
 
     #[test]
     fn resolve_retry_accepts_errors_when_both_sources_empty() {
-        set_test_credentials();
-        let client = ApiClient::new(None).expect("client");
+        let client = ApiClient::new().expect("client");
         let pr = PaymentRequired {
             accepts: Value::Null,
             raw_body: Value::Null,
@@ -2762,8 +2355,7 @@ mod tests {
         let _dir = seed_cache_with_default("client_dispatch_no_default", None);
         crate::payment_notify::drain_events();
 
-        set_test_credentials();
-        let client = ApiClient::new(None).expect("client");
+        let client = ApiClient::new().expect("client");
         client.apply_config_response(&serde_json::json!({
             "endpointList": { "/api/v6/dex/market/price": "BASIC" },
             "accepts": [{"scheme":"exact","network":"eip155:196","asset":"0xUSDG","payTo":"0xP","amount":{"basic":"100"}}],
@@ -2792,8 +2384,7 @@ mod tests {
         let _dir = seed_cache_with_default("client_dispatch_with_default", Some(sample_default()));
         crate::payment_notify::drain_events();
 
-        set_test_credentials();
-        let client = ApiClient::new(None).expect("client");
+        let client = ApiClient::new().expect("client");
         client.apply_config_response(&serde_json::json!({
             "endpointList": { "/api/v6/dex/market/price-info": "PREMIUM" },
             "accepts": [
@@ -2851,8 +2442,7 @@ mod tests {
             seed_cache_with_default("client_dispatch_intro_with_default", Some(sample_default()));
         crate::payment_notify::drain_events();
 
-        set_test_credentials();
-        let client = ApiClient::new(None).expect("client");
+        let client = ApiClient::new().expect("client");
         client.apply_config_response(&serde_json::json!({
             "endpointList": { "/api/v6/dex/market/price": "BASIC" },
             "accepts": [{"scheme":"exact","network":"eip155:196","asset":"0xUSDG","payTo":"0xP","amount":{"basic":"100"}}],

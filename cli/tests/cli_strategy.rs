@@ -19,8 +19,8 @@
 //!
 //! The remaining rows are `network_required: live` golden/edge cases that need
 //! a logged-in, strategy-enabled wallet (a session carrying `saTeeId`). CI runs
-//! with anonymous / AK read credentials only, so those commands short-circuit
-//! at the local session check. Each such test therefore runs the real command
+//! without a wallet login session, so those commands short-circuit at the local
+//! session check. Each such test therefore runs the real command
 //! through the shared `run_with_retry` helper and then either asserts the golden
 //! outcome (when a strategy wallet session IS present) or skips with a note
 //! (when the session precondition is not met) — mirroring the repo's existing
@@ -37,8 +37,8 @@
 //! IT-015 needs a guaranteed-logged-out home. `ONCHAINOS_HOME` is pointed at a
 //! fresh isolated dir under `cli/target/test_tmp/cli_strategy/` (the agent
 //! sandbox denies writes to `/var/folders/.../T/`, so `tempfile::tempdir()` is
-//! unsafe here) via `Command::env` per-invocation, and inherited `OKX_*`
-//! credentials are scrubbed so the binary cannot fall through to host state.
+//! unsafe here) via `Command::env` per-invocation, so the binary cannot fall
+//! through to host wallet state.
 
 mod common;
 
@@ -392,11 +392,6 @@ fn create_limit_with_wait_reports_settled() {
 fn create_limit_without_login_fails_with_ok_false() {
     let home = fresh_home();
     let output = onchainos()
-        .env_remove("OKX_API_KEY")
-        .env_remove("OKX_ACCESS_KEY")
-        .env_remove("OKX_SECRET_KEY")
-        .env_remove("OKX_PASSPHRASE")
-        .env_remove("OKX_BASE_URL")
         .env("ONCHAINOS_HOME", home.path())
         .args([
             "strategy",

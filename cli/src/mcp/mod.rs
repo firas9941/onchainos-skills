@@ -845,10 +845,10 @@ pub struct McpServer {
 }
 
 impl McpServer {
-    pub fn new(base_url_override: Option<&str>) -> Result<Self> {
+    pub fn new() -> Result<Self> {
         Ok(Self {
             tool_router: Self::tool_router(),
-            client: Arc::new(Mutex::new(ApiClient::new(base_url_override)?)),
+            client: Arc::new(Mutex::new(ApiClient::new()?)),
         })
     }
 }
@@ -2972,8 +2972,8 @@ impl McpServer {
     }
 }
 
-pub async fn serve(base_url_override: Option<&str>) -> Result<()> {
-    let server = McpServer::new(base_url_override)?;
+pub async fn serve() -> Result<()> {
+    let server = McpServer::new()?;
     let service = server.serve(stdio()).await?;
     service.waiting().await?;
     Ok(())

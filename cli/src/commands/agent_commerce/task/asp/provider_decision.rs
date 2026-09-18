@@ -134,6 +134,24 @@ fn already_accepted_result(job_id: &str, kind: DecisionKind) -> Value {
     })
 }
 
+fn broadcast_submitted_result(job_id: &str, kind: DecisionKind, broadcast: Value) -> Value {
+    json!({
+        "phase": "provider_decision",
+        "decision": "ready",
+        "reason": "broadcast_submitted",
+        "nextAction": [],
+        "payload": {
+            "jobId": job_id,
+            "taskType": if kind.is_subscription() { "subscription" } else { "single" },
+            "providerDecision": if kind.is_decline() { "decline" } else { "accept" },
+            "type": kind.biz_type(),
+            "bizType": kind.biz_type(),
+            "status": "broadcast_submitted",
+            "broadcast": broadcast,
+        }
+    })
+}
+
 async fn execute(
     client: &mut TaskApiClient,
     job_id: &str,
@@ -218,21 +236,7 @@ async fn execute(
         ]),
         None,
     );
-    crate::output::success(json!({
-        "phase": "provider_decision",
-        "decision": "ready",
-        "reason": "broadcast_submitted",
-        "nextAction": [{"id":"watch_task","recommend":true,"params":{"jobId":job_id}}],
-        "payload": {
-            "jobId": job_id,
-            "taskType": if kind.is_subscription() { "subscription" } else { "single" },
-            "providerDecision": if kind.is_decline() { "decline" } else { "accept" },
-            "type": kind.biz_type(),
-            "bizType": kind.biz_type(),
-            "status": "broadcast_submitted",
-            "broadcast": broadcast,
-        }
-    }));
+    crate::output::success(broadcast_submitted_result(job_id, kind, broadcast));
     Ok(())
 }
 
@@ -318,6 +322,19 @@ mod tests {
             detail_status(DecisionKind::AcceptSubscription, &json!({"subStatus": 1})),
             Some(1)
         );
+    }
+
+    #[test]
+    fn provider_decisions_do_not_start_a_user_watch() {
+        for kind in [
+            DecisionKind::AcceptJob,
+            DecisionKind::DeclineJob,
+            DecisionKind::AcceptSubscription,
+            DecisionKind::DeclineSubscription,
+        ] {
+            let result = broadcast_submitted_result("job-1", kind, json!({"txHash":"0x1"}));
+            assert_eq!(result["nextAction"], json!([]));
+        }
     }
 
     #[test]

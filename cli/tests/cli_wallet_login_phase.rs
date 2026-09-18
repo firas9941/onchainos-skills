@@ -29,8 +29,7 @@
 //! - `ONCHAINOS_HOME` points at a fresh isolated dir under
 //!   `cli/target/test_tmp/cli_wallet_login_phase/` (the agent sandbox denies
 //!   writes to the system tempdir, so `tempfile::tempdir()` is unsafe here).
-//! - All `OKX_*` / `OKX_BASE_URL` env vars are scrubbed so the binary cannot
-//!   fall through to host credentials.
+//! - Authentication state is isolated through `ONCHAINOS_HOME`.
 //! - The `poll` test targets a synthetic all-zero UUID that can never have a
 //!   stored per-id key, so it deterministically hits the "no login in
 //!   progress" guard regardless of any ambient keyring state.
@@ -85,12 +84,7 @@ fn fresh_home() -> (TestHome, PathBuf) {
 /// Strip host `OKX_*` env vars so each test sees a pristine environment, set
 /// `ONCHAINOS_HOME`, and suppress the browser open (`init` opens best-effort).
 fn scrubbed<'a>(cmd: &'a mut assert_cmd::Command, home: &Path) -> &'a mut assert_cmd::Command {
-    cmd.env_remove("OKX_API_KEY")
-        .env_remove("OKX_ACCESS_KEY")
-        .env_remove("OKX_SECRET_KEY")
-        .env_remove("OKX_PASSPHRASE")
-        .env_remove("OKX_BASE_URL")
-        .env("ONCHAINOS_HOME", home)
+    cmd.env("ONCHAINOS_HOME", home)
         .env("ONCHAINOS_NO_BROWSER", "1")
 }
 
@@ -339,25 +333,14 @@ fn login_poll_interval_is_two_seconds() {
     assert!(AUTH_SOURCE.contains("Duration::from_secs(SOCIAL_LOGIN_POLL_INTERVAL_SECS)"));
 }
 
-/// IT-006 — `init` shows the finish command even against a different backend.
-///
-/// The base URL used to build `data.loginUrl` is override-driven (`OKX_BASE_URL`
-/// → `option_env!` → `DEFAULT_BASE_URL`), so the override host is fed in as the
-/// test input and re-used to build the expected substring — no environment-drift
-/// literal. `data.loginUrl` MUST use the overridden host and
-/// `data.nextSteps.completeLogin` MUST still be present and correct: the
-/// discoverability guarantee is base-URL-independent (spec §7.4/§10.1; C4).
+/// IT-006 — `init` uses the canonical login host and shows the finish command.
 #[test]
-fn login_init_next_steps_base_url_independent() {
-    // Fed to the CLI as `OKX_BASE_URL` AND used to build the expected substring,
-    // so this asserts against the injected value (offline), not a live host.
-    const OVERRIDE_BASE_URL: &str = "https://web3.okx.com";
-
+fn login_init_uses_compiled_base_url_and_shows_next_steps() {
     let (_tmp, home) = fresh_home();
 
-    // `scrubbed` clears any inherited `OKX_BASE_URL`; re-set the override after.
     let output = scrubbed(&mut onchainos(), &home)
-        .env("OKX_BASE_URL", OVERRIDE_BASE_URL)
+        // Legacy runtime endpoint injection must not affect the CLI.
+        .env("OKX_BASE_URL", "https://ignored.invalid")
         .args(["wallet", "login", "--phase", "init"])
         .output()
         .expect("run onchainos");
@@ -367,9 +350,13 @@ fn login_init_next_steps_base_url_independent() {
     let login_url = data["loginUrl"]
         .as_str()
         .expect("init data.loginUrl must be a string");
+    let expected_login_url = format!(
+        "{}/account/sociallogin",
+        env!("ONCHAINOS_COMPILED_BASE_URL").trim_end_matches('/')
+    );
     assert!(
-        login_url.contains(&format!("{OVERRIDE_BASE_URL}/account/sociallogin")),
-        "loginUrl must use the overridden base host\ndata: {data}",
+        login_url.contains(&expected_login_url),
+        "loginUrl must use the compiled base host\ndata: {data}",
     );
 
     let session_id = data["authSessionId"]
@@ -383,6 +370,47 @@ fn login_init_next_steps_base_url_independent() {
         format!("onchainos wallet login --phase poll --session-id {session_id}"),
         "completeLogin must stay correct regardless of base URL\ndata: {data}",
     );
+}
+
+#[test]
+fn removed_base_url_flag_is_rejected() {
+    let (_tmp, home) = fresh_home();
+    let output = scrubbed(&mut onchainos(), &home)
+        .args(["--base-url", "https://ignored.invalid", "wallet", "status"])
+        .output()
+        .expect("run onchainos");
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unexpected argument '--base-url'"));
+}
+
+#[test]
+fn hidden_dev_flag_uses_beta_base_url() {
+    let (_tmp, home) = fresh_home();
+    let output = scrubbed(&mut onchainos(), &home)
+        .args(["--dev", "wallet", "login", "--phase", "init"])
+        .output()
+        .expect("run onchainos");
+
+    let data = assert_ok_and_extract_data(&output);
+    let login_url = data["loginUrl"]
+        .as_str()
+        .expect("init data.loginUrl must be a string");
+    assert!(
+        login_url.starts_with("https://beta.okex.org/account/sociallogin?"),
+        "--dev must select the beta login host\ndata: {data}",
+    );
+}
+
+#[test]
+fn dev_flag_is_hidden_from_help() {
+    let output = onchainos()
+        .arg("--help")
+        .output()
+        .expect("run onchainos --help");
+
+    assert!(output.status.success());
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("--dev"));
 }
 
 // ── legacy status flag compatibility ───────────────────────────────────────
