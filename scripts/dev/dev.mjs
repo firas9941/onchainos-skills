@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import fs from "node:fs";
+import crypto from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
@@ -10,8 +11,11 @@ const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(scriptDir, "../..");
 const codexDir = path.join(repoRoot, ".codex");
 const binDir = path.join(codexDir, "bin");
+const a2aInstallDir = path.join(codexDir, "a2a");
+const localA2a = path.join(a2aInstallDir, "node_modules", ".bin", "okx-a2a");
 const projectSkillsDir = path.join(repoRoot, ".agents", "skills");
 const codexConfig = path.join(codexDir, "config.toml");
+const codexProfileMarker = path.join(codexDir, "profile-name");
 const sourceSkillsDir = path.join(repoRoot, "skills");
 const generatedSkillPrefix = "# onchainos-dev generated skill conflict";
 
@@ -155,6 +159,12 @@ function findExecutableOutsideProject(name) {
   for (const dir of (process.env.PATH || "").split(path.delimiter)) {
     if (!dir || path.resolve(dir) === path.resolve(binDir)) continue;
     const candidate = path.join(dir, name);
+    // The Linux development dispatcher may itself be on PATH. Never treat it
+    // as the globally installed executable, otherwise .codex/bin/<name>.real
+    // points back into this project and commands recurse forever.
+    if (process.platform === "linux" && name === "okx-a2a"
+      && [linuxA2aDispatcherPath(), linuxOnchainosDispatcherPath(), legacyLinuxCliDispatcherPath()]
+        .some((dispatcher) => sameFile(candidate, dispatcher))) continue;
     try { if (fs.statSync(candidate).mode & 0o111) return fs.realpathSync(candidate); } catch {}
   }
   return null;
@@ -165,16 +175,126 @@ function linkFile(source, target) {
   fs.symlinkSync(source, target);
 }
 
-function ensureLinuxCliLink() {
-  if (process.platform !== "linux") return;
-  const userLink = path.join(os.homedir(), ".local", "bin", "onchainos");
+function ensureLocalA2a() {
+  if (fs.existsSync(localA2a)) return localA2a;
+
+  ensureDir(a2aInstallDir);
+  const result = spawnSync("npm", [
+    "install",
+    "--prefix", a2aInstallDir,
+    "--no-save",
+    "--package-lock=false",
+    "@okxweb3/a2a-node@latest",
+  ], { cwd: repoRoot, stdio: "inherit" });
+  if (result.error) fail(`failed to install local okx-a2a: ${result.error.message}`);
+  if (result.status !== 0 || !fs.existsSync(localA2a)) {
+    fail(`failed to install local okx-a2a (exit code ${result.status ?? 1})`);
+  }
+  return localA2a;
+}
+
+function linuxA2aLink() {
+  return path.join(os.homedir(), ".local", "bin", "okx-a2a");
+}
+
+function linuxOnchainosLink() {
+  return path.join(os.homedir(), ".local", "bin", "onchainos");
+}
+
+function linuxOnchainosRelease() {
+  return path.join(os.homedir(), ".local", "bin", "onchainos.release");
+}
+
+function linuxOnchainosDispatcherPath() {
+  return path.join(codexHome(), "onchainos-linux-dev-dispatch.sh");
+}
+
+function linuxA2aDispatcherPath() {
+  return path.join(codexHome(), "okx-a2a-linux-dev-dispatch.sh");
+}
+
+function legacyLinuxCliDispatcherPath() {
+  return path.join(codexHome(), "onchainos-dev-dispatch.sh");
+}
+
+function removeLegacyLinuxCliLink() {
+  if (process.platform !== "linux") return false;
+  const userLink = linuxOnchainosLink();
   const projectWrapper = path.join(binDir, "onchainos");
+  try {
+    if (!fs.lstatSync(userLink).isSymbolicLink()) return false;
+    const target = path.resolve(path.dirname(userLink), fs.readlinkSync(userLink));
+    if (target !== projectWrapper) return false;
+    fs.unlinkSync(userLink);
+    return true;
+  } catch (error) {
+    if (error.code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+function isManagedCliDispatcher(link) {
+  try {
+    return fs.lstatSync(link).isSymbolicLink()
+      && (sameFile(link, linuxA2aDispatcherPath()) || sameFile(link, linuxOnchainosDispatcherPath())
+        || sameFile(link, legacyLinuxCliDispatcherPath()));
+  } catch {
+    return false;
+  }
+}
+
+function ensureLinuxCliDispatcher() {
+  if (process.platform !== "linux") return;
+  const userLink = linuxOnchainosLink();
+  const release = linuxOnchainosRelease();
   const existing = fs.lstatSync(userLink, { throwIfNoEntry: false });
-  if (existing?.isDirectory() && !existing.isSymbolicLink()) fail(`cannot replace directory ${userLink} with Linux development CLI link`);
-  if (existing) fs.unlinkSync(userLink);
-  fs.mkdirSync(path.dirname(userLink), { recursive: true, mode: 0o755 });
-  fs.symlinkSync(projectWrapper, userLink);
-  console.log(`Linux CLI: ${userLink} -> ${projectWrapper}`);
+  if (existing && !existing.isSymbolicLink()) {
+    if (fs.existsSync(release)) fs.rmSync(release);
+    fs.renameSync(userLink, release);
+  }
+  ensureLinuxDispatcher(userLink, linuxOnchainosDispatcherPath(), path.join(scriptDir, "onchainos-linux-dispatch.sh"));
+  ensureLinuxDispatcher(linuxA2aLink(), linuxA2aDispatcherPath(), path.join(scriptDir, "okx-a2a-linux-dispatch.sh"));
+}
+
+function ensureLinuxDispatcher(userLink, dispatcher, source) {
+  fs.mkdirSync(codexHome(), { recursive: true, mode: 0o700 });
+  if (fs.existsSync(dispatcher) && !fs.readFileSync(dispatcher, "utf8").includes("# onchainos-dev generated")) {
+    fail(`refusing to replace existing Codex CLI dispatcher: ${dispatcher}`);
+  }
+  fs.copyFileSync(source, dispatcher);
+  fs.chmodSync(dispatcher, 0o755);
+  const existing = fs.lstatSync(userLink, { throwIfNoEntry: false });
+  if (existing && !isManagedCliDispatcher(userLink)) {
+    fail(`refusing to replace existing ~/.local/bin/onchainos; remove or rename it before enabling the development dispatcher`);
+  }
+  const alreadyLinked = Boolean(existing) && sameFile(userLink, dispatcher);
+  if (existing && !alreadyLinked) fs.unlinkSync(userLink);
+  if (!alreadyLinked) {
+    fs.mkdirSync(path.dirname(userLink), { recursive: true, mode: 0o755 });
+    fs.symlinkSync(dispatcher, userLink);
+  }
+  console.log(`Linux dispatcher: ${userLink} -> ${dispatcher}`);
+}
+
+function removeLinuxCliDispatcherIfUnused() {
+  if (process.platform !== "linux") return;
+  const profilesDir = codexHome();
+  let hasOnchainosProfile = false;
+  try {
+    hasOnchainosProfile = fs.readdirSync(profilesDir).some((entry) => /^onchainos-[A-Za-z0-9_-]+\.config\.toml$/.test(entry));
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+  const links = [[linuxA2aLink(), linuxA2aDispatcherPath()]];
+  if (!hasOnchainosProfile) {
+    for (const [userLink, dispatcher] of links) {
+      if (!isManagedCliDispatcher(userLink)) continue;
+      fs.unlinkSync(userLink);
+      fs.rmSync(dispatcher, { force: true });
+      console.log(`Removed unused Linux dispatcher: ${userLink}`);
+    }
+    fs.rmSync(legacyLinuxCliDispatcherPath(), { force: true });
+  }
 }
 
 function dedupePath(entries) {
@@ -207,6 +327,60 @@ function updateCodexPath() {
   chmodPrivate(codexConfig);
 }
 
+function codexHome() {
+  return process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
+}
+
+function profileNameForRepo() {
+  const base = path.basename(repoRoot).replaceAll(/[^A-Za-z0-9_-]/g, "-") || "workspace";
+  const suffix = crypto.createHash("sha256").update(fs.realpathSync(repoRoot)).digest("hex").slice(0, 12);
+  return `onchainos-${base}-${suffix}`;
+}
+
+function readProfileMarker() {
+  try {
+    const profile = fs.readFileSync(codexProfileMarker, "utf8").trim();
+    return /^[A-Za-z0-9_-]+$/.test(profile) ? profile : null;
+  } catch (error) {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+function ensureCodexProfile() {
+  const profile = readProfileMarker() || profileNameForRepo();
+  const profileFile = path.join(codexHome(), `${profile}.config.toml`);
+  fs.mkdirSync(codexHome(), { recursive: true, mode: 0o700 });
+
+  const existing = fs.lstatSync(profileFile, { throwIfNoEntry: false });
+  if (existing) {
+    if (!existing.isSymbolicLink() || !sameFile(profileFile, codexConfig)) {
+      fail(`refusing to replace existing Codex profile: ${profileFile}`);
+    }
+  } else {
+    fs.symlinkSync(codexConfig, profileFile);
+  }
+  fs.writeFileSync(codexProfileMarker, `${profile}\n`, { mode: 0o600 });
+  chmodPrivate(codexProfileMarker);
+  return { profile, profileFile };
+}
+
+function removeCodexProfile() {
+  const profile = readProfileMarker();
+  if (!profile) return false;
+  const profileFile = path.join(codexHome(), `${profile}.config.toml`);
+  try {
+    if (fs.lstatSync(profileFile).isSymbolicLink() && sameFile(profileFile, codexConfig)) {
+      fs.unlinkSync(profileFile);
+      console.log(`Removed Codex development profile: ${profileFile}`);
+    }
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+  fs.unlinkSync(codexProfileMarker);
+  return true;
+}
+
 function section(text, name) {
   const match = text.match(new RegExp(`^\\[${name.replaceAll(".", "\\.")}\\]\\n([\\s\\S]*?)(?=^\\[|$)`, "m"));
   return match?.[1] || "";
@@ -227,20 +401,30 @@ function init() {
   ensureDir(binDir);
   for (const dir of ["build/cargo-home", "build/cargo-target", "runtime/onchainos", "runtime/a2a", "runtime/a2a-spool", "runtime/tmp"]) ensureDir(path.join(codexDir, dir));
 
-  const a2a = findExecutableOutsideProject("okx-a2a");
-  if (!a2a) fail("global okx-a2a is required but was not found on PATH");
+  const a2a = ensureLocalA2a();
   linkFile(path.join(scriptDir, "onchainos.sh"), path.join(binDir, "onchainos"));
   linkFile(path.join(scriptDir, "okx-a2a.sh"), path.join(binDir, "okx-a2a"));
   linkFile(a2a, path.join(binDir, "okx-a2a.real"));
-  ensureLinuxCliLink();
+  const removedLegacyLink = removeLegacyLinuxCliLink();
+  ensureLinuxCliDispatcher();
   updateCodexPath();
+  const profile = ensureCodexProfile();
   const skills = refreshSkills();
+  const doctorArgs = a2aDaemonIsRunning()
+    ? ["doctor", "--non-interactive"]
+    : ["doctor", "--fix", "--non-interactive"];
+  const a2aDoctor = runA2a(doctorArgs);
+  if (a2aDoctor?.error) fail(`failed to run okx-a2a doctor: ${a2aDoctor.error.message}`);
+  if (a2aDoctor?.status !== 0) fail(`okx-a2a doctor failed with exit code ${a2aDoctor?.status ?? 1}`);
 
   console.log("Initialized project-local OnchainOS development.");
   console.log(`  CLI:    ${path.join(binDir, "onchainos")}`);
   console.log(`  A2A:    ${path.join(binDir, "okx-a2a")} -> ${a2a}`);
+  console.log(`  Codex:  -C ${repoRoot} -p ${profile.profile} --disable shell_snapshot`);
+  console.log(`  Profile: ${profile.profileFile} -> ${codexConfig}`);
   console.log(`  Skills: linked=${skills.linked.length} global-conflicts-disabled=${skills.conflicts.length}`);
-  console.log("Reload Codex and start a new task before validating Skill routing.");
+  if (removedLegacyLink) console.log("Replaced the old worktree-specific Linux CLI link with the dispatcher.");
+  console.log("Source scripts/dev/codex-shell.sh once in your interactive shell to make bare `codex` add these options from this worktree.");
 }
 
 function build() {
@@ -260,6 +444,12 @@ function doctor() {
   catch { errors.push("okx-a2a.real is missing or broken"); }
   const configText = fs.existsSync(codexConfig) ? fs.readFileSync(codexConfig, "utf8") : "";
   if (!configText.includes(binDir)) errors.push(".codex/config.toml does not put .codex/bin on PATH");
+  const profile = readProfileMarker();
+  if (!profile) errors.push(".codex/profile-name is missing or invalid");
+  else {
+    const profileFile = path.join(codexHome(), `${profile}.config.toml`);
+    if (!sameFile(profileFile, codexConfig)) errors.push(`Codex profile does not point to this worktree: ${profileFile}`);
+  }
 
   const skills = sourceSkills();
   for (const skill of skills) {
@@ -283,6 +473,17 @@ function runA2a(args, quiet = false) {
   return spawnSync(wrapper, args, { cwd: repoRoot, stdio: quiet ? "ignore" : "inherit" });
 }
 
+function a2aDaemonIsRunning() {
+  const wrapper = path.join(binDir, "okx-a2a");
+  if (!fs.existsSync(wrapper)) return false;
+  const result = spawnSync(wrapper, ["daemon", "status"], {
+    cwd: repoRoot,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  return result.status === 0 && /^running\b/m.test(`${result.stdout}\n${result.stderr}`);
+}
+
 function stop() {
   const result = runA2a(["daemon", "stop"], true);
   if (result && result.status !== 0) console.log("A2A daemon was not running or could not be stopped cleanly.");
@@ -299,26 +500,13 @@ function removeOwnedProjectSkills() {
   }
 }
 
-function removeLinuxCliLink() {
-  if (process.platform !== "linux") return;
-  const userLink = path.join(os.homedir(), ".local", "bin", "onchainos");
-  const projectWrapper = path.join(binDir, "onchainos");
-  try {
-    if (!fs.lstatSync(userLink).isSymbolicLink()) return;
-    const target = path.resolve(path.dirname(userLink), fs.readlinkSync(userLink));
-    if (target !== projectWrapper) return;
-    fs.unlinkSync(userLink);
-    console.log(`Removed Linux development CLI link: ${userLink}`);
-  } catch (error) {
-    if (error.code !== "ENOENT") throw error;
-  }
-}
-
 function clean() {
   stop();
   removeOwnedProjectSkills();
-  removeLinuxCliLink();
-  for (const relative of ["bin", "build", "runtime/a2a-spool", "runtime/tmp"]) fs.rmSync(path.join(codexDir, relative), { recursive: true, force: true });
+  removeLegacyLinuxCliLink();
+  removeCodexProfile();
+  removeLinuxCliDispatcherIfUnused();
+  for (const relative of ["bin", "a2a", "build", "runtime/a2a-spool", "runtime/tmp"]) fs.rmSync(path.join(codexDir, relative), { recursive: true, force: true });
   fs.rmSync(path.join(codexDir, "runtime", "onchainos"), { recursive: true, force: true });
   fs.rmSync(path.join(codexDir, "runtime", "a2a"), { recursive: true, force: true });
   fs.rmSync(codexConfig, { force: true });
