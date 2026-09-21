@@ -58,6 +58,7 @@ CLAUDE.local.md
 .codex/runtime/
 .codex/skills/
 .codex/config.toml
+.codex/profile-name
 .cursor
 .ai-mat
 .cursorrules
@@ -110,6 +111,9 @@ scripts/dev/*
 !scripts/dev/dev.test.mjs
 !scripts/dev/okx-a2a.sh
 !scripts/dev/onchainos.sh
+!scripts/dev/codex-shell.sh
+!scripts/dev/okx-a2a-linux-dispatch.sh
+!scripts/dev/onchainos-linux-dispatch.sh
 
 .aiide/
 .aiide-preview/
