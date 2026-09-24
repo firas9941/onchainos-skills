@@ -1,4 +1,4 @@
-//! A2A one-time-task lifecycle projection and its scoped local-history fallback.
+//! A2A one-time-task and subscription lifecycle projections with scoped local-history fallback.
 //!
 //! Fresh task detail remains authoritative for the current phase. Historical
 //! system events only fill timestamps and exception context. The SQLite access
@@ -48,6 +48,21 @@ pub(crate) enum LifecycleEventKind {
     Expired,
     Refunded,
     Failed,
+    SubscriptionOpened,
+    SubscriptionCreated,
+    SubscriptionAspSelected,
+    SubscriptionCancelled,
+    SubscriptionDeliveryRejected,
+    SubscriptionRefundApproved,
+    SubscriptionDisputed,
+    SubscriptionTrialConverted,
+    SubscriptionRenewed,
+    SubscriptionExpiryWarning,
+    SubscriptionCompleted,
+    SubscriptionClosed,
+    SubscriptionFailed,
+    SubscriptionAutoRefunded,
+    SubscriptionIncomeClaimed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,6 +76,10 @@ pub(crate) struct LifecycleEvent {
     pub deadline_at: Option<String>,
     pub authoritative_status: Option<String>,
     pub job_type: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     pub sender_inbox_id: Option<String>,
 }
 
@@ -88,6 +107,10 @@ pub(crate) struct Milestones {
 pub(crate) enum LifecyclePhase {
     Initializing,
     WaitingForAsp,
+    FreeTrial,
+    ActiveSubscription,
+    RenewalGracePeriod,
+    AwaitingAspDecision,
     AspExecuting,
     WaitingForUserReview,
     Rejected,
@@ -122,6 +145,8 @@ pub(crate) struct LifecycleDisplayNode {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct LifecycleDisplay {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub template_id: Option<String>,
     pub progress_step: u8,
     pub progress_total: u8,
     pub deliverable_available: bool,
@@ -129,6 +154,8 @@ pub(crate) struct LifecycleDisplay {
     pub timeline: Vec<LifecycleDisplayNode>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub follow_up: Vec<LifecycleDisplayNode>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub choices: Vec<String>,
     pub current_summary: String,
     pub handled_by: String,
     pub next: String,
@@ -181,6 +208,59 @@ struct ReconciledCurrent {
     status_from_local: bool,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SubscriptionMilestones {
+    created_at: Option<String>,
+    accept_deadline_at: Option<String>,
+    accepted_at: Option<String>,
+    trial_started_at: Option<String>,
+    trial_ends_at: Option<String>,
+    trial_converted_at: Option<String>,
+    current_period_started_at: Option<String>,
+    current_period_ends_at: Option<String>,
+    grace_period_ends_at: Option<String>,
+    next_charge_at: Option<String>,
+    last_renewed_at: Option<String>,
+    renewal_warning_at: Option<String>,
+    cancellation_requested_at: Option<String>,
+    rejected_at: Option<String>,
+    disputed_at: Option<String>,
+    completed_at: Option<String>,
+    closed_at: Option<String>,
+    expired_at: Option<String>,
+    refunded_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SubscriptionLifecycleSnapshot {
+    job_id: String,
+    task_type: String,
+    phase: LifecyclePhase,
+    status_label: String,
+    responsible_party: String,
+    next_action: String,
+    confidence: LifecycleConfidence,
+    authoritative_status: String,
+    status_source: String,
+    history_available: bool,
+    history_read_succeeded: bool,
+    history_event_count: usize,
+    asp_agent_id: Option<String>,
+    review_deadline_at: Option<String>,
+    trial_type: Option<i64>,
+    auto_renew: Option<i64>,
+    period_index: Option<i64>,
+    refund_amount: Option<String>,
+    refund_token_symbol: Option<String>,
+    refund_tx_hash: Option<String>,
+    milestones: SubscriptionMilestones,
+    events: Vec<LifecycleEvent>,
+    display: LifecycleDisplay,
+    synced_at: String,
+}
+
 /// CLI handler for the read-only User-side lifecycle query.
 pub async fn handle_lifecycle(
     client: &mut TaskApiClient,
@@ -200,6 +280,29 @@ pub async fn handle_lifecycle(
         Ok(value) => value,
         Err(_) => {
             let local = read_scoped_local_history(job_id, &resolved_agent_id);
+            let events = events_from_history(job_id, &local.messages);
+            if let Ok(subscription_detail) =
+                crate::commands::agent_commerce::task::user::subscription_ops::fetch_subscribe_detail_for_agent(
+                    client,
+                    job_id,
+                    &resolved_agent_id,
+                )
+                .await
+            {
+                if subscription_detail_matches_job(&subscription_detail, job_id) {
+                    crate::output::success(build_subscription_snapshot_with_user_close(
+                        job_id,
+                        &subscription_detail,
+                        events,
+                        local.read_succeeded,
+                        crate::commands::agent_commerce::task::user::refund::has_created_subscription_close_receipt(
+                            job_id,
+                            &resolved_agent_id,
+                        ),
+                    ));
+                    return Ok(());
+                }
+            }
             let mut snapshot = snapshot_from_local_fallback(job_id, &local);
             snapshot.display.notice = Some(if snapshot.history_available {
                 "Latest task details are unavailable; showing the latest verified local task record."
@@ -226,7 +329,67 @@ pub async fn handle_lifecycle(
         }
     }
     let events = events_from_history(job_id, &messages);
+
+    if projected.job_type == Some(1) {
+        let subscription_detail =
+            match crate::commands::agent_commerce::task::user::subscription_ops::fetch_subscribe_detail_for_agent(
+                client,
+                job_id,
+                &resolved_agent_id,
+            )
+            .await
+            {
+                Ok(value) if subscription_detail_matches_job(&value, job_id) => value,
+                Ok(_) | Err(_) => {
+                    let mut snapshot = unavailable_snapshot(
+                        job_id,
+                        "The subscription type was confirmed, but its latest subscription detail is unavailable. Try again later.",
+                    );
+                    snapshot.task_type = "subscription".to_string();
+                    snapshot.asp_agent_id = projected.provider_agent_id;
+                    crate::output::success(snapshot);
+                    return Ok(());
+                }
+            };
+        crate::output::success(build_subscription_snapshot_with_user_close(
+            job_id,
+            &subscription_detail,
+            events,
+            history_read_succeeded,
+            crate::commands::agent_commerce::task::user::refund::has_created_subscription_close_receipt(
+                job_id,
+                &resolved_agent_id,
+            ),
+        ));
+        return Ok(());
+    }
+
     let reconciled = reconcile_current(&projected, &events);
+
+    if matches!(reconciled.job_type, None | Some(1)) {
+        if let Ok(subscription_detail) =
+            crate::commands::agent_commerce::task::user::subscription_ops::fetch_subscribe_detail_for_agent(
+                client,
+                job_id,
+                &resolved_agent_id,
+            )
+            .await
+        {
+            if subscription_detail_matches_job(&subscription_detail, job_id) {
+                crate::output::success(build_subscription_snapshot_with_user_close(
+                    job_id,
+                    &subscription_detail,
+                    events,
+                    history_read_succeeded,
+                    crate::commands::agent_commerce::task::user::refund::has_created_subscription_close_receipt(
+                        job_id,
+                        &resolved_agent_id,
+                    ),
+                ));
+                return Ok(());
+            }
+        }
+    }
 
     if reconciled.job_type != Some(0) {
         let task_type = match reconciled.job_type {
@@ -282,6 +445,697 @@ pub async fn handle_lifecycle(
     );
     crate::output::success(snapshot);
     Ok(())
+}
+
+fn build_subscription_snapshot(
+    job_id: &str,
+    detail: &Value,
+    events: Vec<LifecycleEvent>,
+    history_read_succeeded: bool,
+) -> SubscriptionLifecycleSnapshot {
+    build_subscription_snapshot_with_user_close(
+        job_id,
+        detail,
+        events,
+        history_read_succeeded,
+        false,
+    )
+}
+
+fn build_subscription_snapshot_with_user_close(
+    job_id: &str,
+    detail: &Value,
+    events: Vec<LifecycleEvent>,
+    history_read_succeeded: bool,
+    user_close_submitted: bool,
+) -> SubscriptionLifecycleSnapshot {
+    let status = detail_i64(detail, &["status", "subStatus"]);
+    let trial_type = detail_i64(detail, &["trialType"]);
+    let auto_renew = detail_i64(detail, &["autoRenew"]);
+    let period_index = detail_i64(detail, &["periodIndex"]);
+    let mut milestones = subscription_milestones(detail, &events);
+    let mut refund_context = super::PreFetchedTaskContext::from_api_response(detail);
+    // The native subscription-detail endpoint already establishes this type,
+    // even when a legacy response omits jobType. Keep lifecycle settlement
+    // semantics aligned with refund.rs: a paid formal subscription in fresh
+    // Failed(9) is the documented refunded terminal state.
+    refund_context.job_type = Some(1);
+    refund_context.status = status;
+    refund_context.trial_type = trial_type;
+    let refund_proven = trial_type != Some(1)
+        && (crate::commands::agent_commerce::task::user::refund::authoritative_refund_settlement_confirmed(
+            &refund_context,
+            9,
+        ) || (milestones.refunded_at.is_some()
+            && detail_string(detail, &["refundTxHash", "refundTransactionHash"]).is_some()));
+    let in_grace = status == Some(1)
+        && auto_renew == Some(1)
+        && timestamp_has_passed(milestones.current_period_ends_at.as_deref())
+        && timestamp_is_future(milestones.grace_period_ends_at.as_deref());
+    let phase = subscription_phase(status, trial_type, in_grace, refund_proven);
+    let template_number = subscription_template_number(
+        status,
+        trial_type,
+        auto_renew,
+        in_grace,
+        refund_proven,
+        &milestones,
+        &events,
+        user_close_submitted,
+    );
+
+    if milestones.accepted_at.is_none()
+        && matches!(
+            phase,
+            LifecyclePhase::FreeTrial
+                | LifecyclePhase::ActiveSubscription
+                | LifecyclePhase::RenewalGracePeriod
+                | LifecyclePhase::AwaitingAspDecision
+                | LifecyclePhase::Disputed
+                | LifecyclePhase::Completed
+                | LifecyclePhase::Closed
+                | LifecyclePhase::Refunded
+                | LifecyclePhase::Failed
+        )
+    {
+        milestones.accepted_at = subscription_event_time(
+            &events,
+            &[
+                LifecycleEventKind::SubscriptionCreated,
+                LifecycleEventKind::SubscriptionAspSelected,
+            ],
+        );
+    }
+
+    let close_pending = status == Some(0) && user_close_submitted;
+    let (status_label, responsible_party, next_action) = if close_pending {
+        (
+            "Subscription closure submitted".to_string(),
+            "platform".to_string(),
+            "Wait for the subscription lifecycle and wallet order to confirm the closure."
+                .to_string(),
+        )
+    } else {
+        (
+            subscription_status_label(template_number, phase, auto_renew).to_string(),
+            subscription_responsible_party(template_number, phase).to_string(),
+            subscription_next_action(
+                template_number,
+                phase,
+                auto_renew,
+                detail,
+                &milestones,
+                &events,
+            ),
+        )
+    };
+    let history_available = !events.is_empty();
+    let mut display = build_subscription_display(
+        phase,
+        template_number,
+        &status_label,
+        &responsible_party,
+        &next_action,
+    );
+    if close_pending {
+        display.choices.clear();
+        display.notice = Some(
+            "The close request is already submitted. Do not submit another close request while reconciliation is pending."
+                .to_string(),
+        );
+    }
+
+    SubscriptionLifecycleSnapshot {
+        job_id: detail_string(detail, &["jobId"])
+            .filter(|value| value == job_id)
+            .unwrap_or_else(|| job_id.to_string()),
+        task_type: "subscription".to_string(),
+        phase,
+        status_label,
+        responsible_party,
+        next_action,
+        confidence: if status.is_none() {
+            LifecycleConfidence::Unknown
+        } else if history_available {
+            LifecycleConfidence::Confirmed
+        } else {
+            LifecycleConfidence::Partial
+        },
+        authoritative_status: status
+            .map(subscription_authoritative_status)
+            .unwrap_or_else(|| "unavailable".to_string()),
+        status_source: "subscription_detail".to_string(),
+        history_available,
+        history_read_succeeded,
+        history_event_count: events.len(),
+        asp_agent_id: detail_string(detail, &["providerAgentId", "aspAgentId"]),
+        review_deadline_at: detail_string(
+            detail,
+            &["rejectWindowEndsAt", "responseDeadline", "reviewDeadlineAt"],
+        ),
+        trial_type,
+        auto_renew,
+        period_index,
+        refund_amount: detail_string(detail, &["refundAmount", "paymentTokenAmount"]),
+        refund_token_symbol: detail_string(
+            detail,
+            &["refundTokenSymbol", "paymentTokenSymbol", "tokenSymbol"],
+        ),
+        refund_tx_hash: detail_string(detail, &["refundTxHash", "refundTransactionHash"]),
+        milestones,
+        events,
+        display,
+        synced_at: chrono::Utc::now().to_rfc3339(),
+    }
+}
+
+/// Reuse the authoritative subscription projection anywhere a compact status
+/// label/description is needed. This keeps `agent status` and active-task rows
+/// aligned with the full lifecycle output for ambiguous terminal states.
+pub(crate) fn subscription_status_copy(
+    detail: &Value,
+    user_close_submitted: bool,
+) -> (String, String) {
+    let job_id = detail_string(detail, &["jobId", "subId"]).unwrap_or_default();
+    let snapshot = build_subscription_snapshot_with_user_close(
+        &job_id,
+        detail,
+        Vec::new(),
+        true,
+        user_close_submitted,
+    );
+    (snapshot.status_label, snapshot.display.current_summary)
+}
+
+fn subscription_detail_matches_job(detail: &Value, job_id: &str) -> bool {
+    detail_string(detail, &["jobId"]).as_deref() == Some(job_id)
+}
+
+fn subscription_authoritative_status(status: i64) -> String {
+    match status {
+        -1 | 0 | 1 | 3 | 4 | 6 | 7 | 8 | 9 => super::state_machine::SubStatus::from_code(status)
+            .as_str()
+            .to_string(),
+        value => format!("unknown_{value}"),
+    }
+}
+
+fn detail_i64(detail: &Value, keys: &[&str]) -> Option<i64> {
+    keys.iter()
+        .find_map(|key| detail.get(*key).and_then(scalar_i64))
+}
+
+fn detail_string(detail: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| detail.get(*key).and_then(scalar_string))
+}
+
+fn timestamp_has_passed(value: Option<&str>) -> bool {
+    timestamp_seconds(value).is_some_and(|seconds| chrono::Utc::now().timestamp() >= seconds)
+}
+
+fn timestamp_is_future(value: Option<&str>) -> bool {
+    timestamp_seconds(value).is_some_and(|seconds| chrono::Utc::now().timestamp() < seconds)
+}
+
+fn timestamp_seconds(value: Option<&str>) -> Option<i64> {
+    let raw = value?.parse::<i64>().ok()?;
+    Some(if raw.abs() > 10_000_000_000 {
+        raw / 1_000
+    } else {
+        raw
+    })
+}
+
+fn subscription_phase(
+    status: Option<i64>,
+    trial_type: Option<i64>,
+    in_grace: bool,
+    refund_proven: bool,
+) -> LifecyclePhase {
+    match status {
+        Some(-1) => LifecyclePhase::Initializing,
+        Some(0) => LifecyclePhase::WaitingForAsp,
+        Some(1) if in_grace => LifecyclePhase::RenewalGracePeriod,
+        Some(1) if trial_type == Some(1) => LifecyclePhase::FreeTrial,
+        Some(1) => LifecyclePhase::ActiveSubscription,
+        Some(3) => LifecyclePhase::AwaitingAspDecision,
+        Some(4) => LifecyclePhase::Disputed,
+        Some(6) => LifecyclePhase::Completed,
+        Some(7) => LifecyclePhase::Closed,
+        Some(8) => LifecyclePhase::Expired,
+        Some(9) if refund_proven => LifecyclePhase::Refunded,
+        Some(9) => LifecyclePhase::Failed,
+        _ => LifecyclePhase::Unknown,
+    }
+}
+
+fn subscription_template_number(
+    status: Option<i64>,
+    trial_type: Option<i64>,
+    auto_renew: Option<i64>,
+    in_grace: bool,
+    refund_proven: bool,
+    milestones: &SubscriptionMilestones,
+    events: &[LifecycleEvent],
+    user_close_submitted: bool,
+) -> Option<u8> {
+    let has = |kind| events.iter().any(|event| event.kind == kind);
+    let accepted = milestones.accepted_at.is_some()
+        || milestones.trial_started_at.is_some()
+        || milestones.current_period_started_at.is_some()
+        || has(LifecycleEventKind::SubscriptionCreated);
+    let cancelled = user_close_submitted || has(LifecycleEventKind::SubscriptionCancelled);
+    let disputed =
+        has(LifecycleEventKind::SubscriptionDisputed) || has(LifecycleEventKind::DisputeResolved);
+    let grace_ended = timestamp_has_passed(milestones.grace_period_ends_at.as_deref());
+
+    match status {
+        Some(-1) => Some(1),
+        Some(0) => Some(2),
+        Some(1) if trial_type == Some(1) => Some(3),
+        Some(1) if in_grace => Some(11),
+        Some(1) if auto_renew == Some(0) => Some(5),
+        Some(1) => Some(4),
+        Some(3) => Some(14),
+        Some(4) => Some(16),
+        Some(6) if disputed => Some(18),
+        Some(6) => Some(13),
+        Some(8) if cancelled => Some(8),
+        Some(8) => Some(7),
+        Some(7) if !accepted && cancelled => Some(8),
+        Some(7) if !accepted => Some(6),
+        Some(7) if trial_type == Some(1) && accepted => Some(10),
+        Some(7) if grace_ended => Some(12),
+        Some(7) => Some(13),
+        Some(9) if refund_proven && disputed => Some(17),
+        Some(9) if refund_proven => Some(15),
+        Some(9) if trial_type == Some(1) => Some(9),
+        Some(9) if grace_ended => Some(12),
+        _ => None,
+    }
+}
+
+fn subscription_status_label(
+    template_number: Option<u8>,
+    phase: LifecyclePhase,
+    auto_renew: Option<i64>,
+) -> &'static str {
+    match template_number {
+        Some(1) => "Creating subscription task",
+        Some(2) => "Task created; waiting for ASP acceptance",
+        Some(3) => "Free trial active",
+        Some(4) => "Subscription active; auto-renewal enabled",
+        Some(5) => "Subscription active; auto-renewal disabled",
+        Some(6) => "ASP declined the task; task closed",
+        Some(7) => "ASP acceptance deadline passed; task closed automatically",
+        Some(8) => "User closed the task",
+        Some(9) => "Paid subscription did not start; task closed",
+        Some(10) => "Free trial ended; task closed",
+        Some(11) => "Renewal payment failed; subscription is in the grace period",
+        Some(12) => "Payment was not completed during the grace period; subscription ended",
+        Some(13) => "All current service periods ended; subscription completed",
+        Some(14) => "Subscription ended; refund request pending",
+        Some(15) => "Refund completed; task closed",
+        Some(16) => "Evaluation in progress; waiting for evaluator votes",
+        Some(17) => "Evaluation completed; user won; task closed",
+        Some(18) => "Evaluation completed; ASP won; task closed",
+        _ => match phase {
+            LifecyclePhase::Initializing => "Subscription initializing",
+            LifecyclePhase::WaitingForAsp => "Waiting for ASP acceptance",
+            LifecyclePhase::FreeTrial => "Free trial active",
+            LifecyclePhase::ActiveSubscription if auto_renew == Some(0) => {
+                "Active until the current period ends"
+            }
+            LifecyclePhase::ActiveSubscription => "Subscription active",
+            LifecyclePhase::RenewalGracePeriod => "Renewal payment in grace period",
+            LifecyclePhase::AwaitingAspDecision => "Waiting for ASP refund decision",
+            LifecyclePhase::Disputed => "Evaluation in progress",
+            LifecyclePhase::Completed => "Subscription completed",
+            LifecyclePhase::Closed => "Subscription closed",
+            LifecyclePhase::Expired => "Subscription expired",
+            LifecyclePhase::Refunded => "Refund completed",
+            LifecyclePhase::Failed => "Subscription result needs reconciliation",
+            LifecyclePhase::Rejected => "Waiting for ASP refund decision",
+            LifecyclePhase::AspExecuting => "Subscription active",
+            LifecyclePhase::WaitingForUserReview => "Waiting for user review",
+            LifecyclePhase::Unknown => "Status unavailable",
+        },
+    }
+}
+
+fn subscription_responsible_party(
+    template_number: Option<u8>,
+    phase: LifecyclePhase,
+) -> &'static str {
+    match template_number {
+        Some(1) => "platform",
+        Some(2 | 3 | 4 | 5 | 14) => "asp",
+        Some(11) => "user",
+        Some(16) => "evaluator",
+        Some(6 | 7 | 8 | 9 | 10 | 12 | 13 | 15 | 17 | 18) => "none",
+        _ => match phase {
+            LifecyclePhase::Initializing | LifecyclePhase::Disputed | LifecyclePhase::Unknown => {
+                "official"
+            }
+            LifecyclePhase::WaitingForAsp
+            | LifecyclePhase::FreeTrial
+            | LifecyclePhase::ActiveSubscription => "asp",
+            LifecyclePhase::RenewalGracePeriod => "user",
+            LifecyclePhase::AwaitingAspDecision | LifecyclePhase::Rejected => "asp",
+            LifecyclePhase::WaitingForUserReview => "user",
+            LifecyclePhase::AspExecuting => "asp",
+            LifecyclePhase::Completed
+            | LifecyclePhase::Closed
+            | LifecyclePhase::Expired
+            | LifecyclePhase::Refunded
+            | LifecyclePhase::Failed => "none",
+        },
+    }
+}
+
+fn subscription_next_action(
+    template_number: Option<u8>,
+    phase: LifecyclePhase,
+    auto_renew: Option<i64>,
+    detail: &Value,
+    milestones: &SubscriptionMilestones,
+    events: &[LifecycleEvent],
+) -> String {
+    let time = |value: Option<&str>| {
+        format_timestamp(value).unwrap_or_else(|| "an unavailable time".to_string())
+    };
+    let amount = detail_string(
+        detail,
+        &[
+            "serviceTokenAmount",
+            "tokenAmount",
+            "paymentTokenAmount",
+            "refundAmount",
+        ],
+    )
+    .unwrap_or_else(|| "an unavailable amount".to_string());
+    let token = detail_string(
+        detail,
+        &[
+            "serviceTokenSymbol",
+            "tokenSymbol",
+            "paymentTokenSymbol",
+            "refundTokenSymbol",
+        ],
+    )
+    .unwrap_or_else(|| "an unavailable token".to_string());
+    let reason = detail_string(
+        detail,
+        &[
+            "failReason",
+            "failReasopn",
+            "aspRejectReason",
+            "refundReason",
+            "reason",
+        ],
+    )
+    .or_else(|| events.iter().rev().find_map(|event| event.reason.clone()))
+    .unwrap_or_else(|| "unavailable".to_string());
+    let next_action = detail_string(detail, &["nextAction", "recommendedAction"])
+        .unwrap_or_else(|| "fund the wallet and refresh any required allowance".to_string());
+
+    match template_number {
+        Some(1) => "Wait for subscription task creation to complete.".to_string(),
+        Some(2) => format!(
+            "Wait for the ASP to accept before {}. If the ASP does not respond before the deadline, the task will close automatically and any paid service fee will be returned to the wallet.",
+            time(milestones.accept_deadline_at.as_deref())
+        ),
+        Some(3) => {
+            let trial_end = time(milestones.trial_ends_at.as_deref());
+            let first_charge = time(
+                detail_string(detail, &["firstChargeAt", "nextChargeAt", "nextChargeTime"])
+                    .as_deref()
+                    .or(milestones.trial_ends_at.as_deref()),
+            );
+            let last_cancel = time(
+                detail_string(detail, &["lastCancelAt", "cancelDeadline"])
+                    .as_deref()
+                    .or(milestones.trial_ends_at.as_deref()),
+            );
+            format!(
+                "The free trial ends at {trial_end}. The system will charge {amount} {token} at {first_charge} and convert it to a paid subscription. Cancel before {last_cancel} if you do not want to continue."
+            )
+        }
+        Some(4) => format!(
+            "The system will automatically charge {amount} {token} at {}. Keep enough wallet balance and allowance available.",
+            time(milestones.next_charge_at.as_deref().or(milestones.current_period_ends_at.as_deref()))
+        ),
+        Some(5) => format!(
+            "The current service remains available until {} and will then end automatically. Enable auto-renewal before expiry to continue.",
+            time(milestones.current_period_ends_at.as_deref())
+        ),
+        Some(6 | 7 | 8) => "No action is required. A supported free-trial entitlement is unaffected; any paid service fee will be returned automatically when applicable.".to_string(),
+        Some(9) => format!(
+            "Charge failure reason: {reason}. The system will not retry automatically. To continue, {next_action}, then subscribe again."
+        ),
+        Some(10) => "No action is required. The paid subscription did not begin, so no subscription fee will be charged.".to_string(),
+        Some(11) => format!(
+            "The grace period ends at {}. Before then, {next_action}. Service remains active during the grace period and the system will keep retrying; if payment is still incomplete at expiry, the subscription will end automatically. Charge failure reason: {reason}.",
+            time(milestones.grace_period_ends_at.as_deref())
+        ),
+        Some(12) => "No action is required. Subscribe again if you want to continue using the service.".to_string(),
+        Some(13) => "No action is required. Subscribe again to continue using the service.".to_string(),
+        Some(14) => format!(
+            "The ASP must approve the refund or request an evaluation before {}. If no action is taken by the deadline, the system will approve the refund automatically.",
+            time(detail_string(detail, &["rejectWindowEndsAt", "responseDeadline", "reviewDeadlineAt"]).as_deref())
+        ),
+        Some(15) => format!(
+            "No action is required. The current-period fee of {amount} {token} will be returned automatically to the wallet."
+        ),
+        Some(16) => format!(
+            "Evaluators must finish voting before {}. The platform will handle the current-period fee according to the result.",
+            time(detail_string(detail, &["votingDeadline", "voteCommitDeadline", "reviewDeadlineAt"]).as_deref())
+        ),
+        Some(17) => format!(
+            "The current-period fee of {amount} {token} will be returned automatically to the wallet."
+        ),
+        Some(18) => "The current-period fee will not be refunded; the system will settle it to the ASP automatically.".to_string(),
+        _ => match phase {
+            LifecyclePhase::Initializing => "Wait for on-chain confirmation".to_string(),
+            LifecyclePhase::WaitingForAsp => "Wait for the ASP to accept the subscription".to_string(),
+            LifecyclePhase::FreeTrial => "Use the service or cancel before the trial ends if you do not want the first charge".to_string(),
+            LifecyclePhase::ActiveSubscription if auto_renew == Some(0) => "Enable auto-renewal before the current period ends to continue the service".to_string(),
+            LifecyclePhase::ActiveSubscription | LifecyclePhase::AspExecuting => "Continue using the service and keep enough balance for the next renewal".to_string(),
+            LifecyclePhase::RenewalGracePeriod => "Fund the wallet before the grace period ends so renewal can complete".to_string(),
+            LifecyclePhase::AwaitingAspDecision | LifecyclePhase::Rejected => "Wait for the ASP to approve the refund or request an evaluation".to_string(),
+            LifecyclePhase::Disputed => "Wait for the evaluation result".to_string(),
+            LifecyclePhase::WaitingForUserReview => "Review the current delivery".to_string(),
+            LifecyclePhase::Failed => "Reconcile the final payment or refund result".to_string(),
+            LifecyclePhase::Completed | LifecyclePhase::Closed | LifecyclePhase::Expired | LifecyclePhase::Refunded => "No further subscription action".to_string(),
+            LifecyclePhase::Unknown => "Try the subscription query again later".to_string(),
+        },
+    }
+}
+
+fn subscription_event_time(
+    events: &[LifecycleEvent],
+    kinds: &[LifecycleEventKind],
+) -> Option<String> {
+    events
+        .iter()
+        .find(|event| kinds.contains(&event.kind))
+        .and_then(|event| event.occurred_at.clone())
+}
+
+fn subscription_last_event_time(
+    events: &[LifecycleEvent],
+    kinds: &[LifecycleEventKind],
+) -> Option<String> {
+    events
+        .iter()
+        .rev()
+        .find(|event| kinds.contains(&event.kind))
+        .and_then(|event| event.occurred_at.clone())
+}
+
+fn subscription_milestones(detail: &Value, events: &[LifecycleEvent]) -> SubscriptionMilestones {
+    let from_detail = |keys: &[&str]| detail_string(detail, keys);
+    SubscriptionMilestones {
+        created_at: from_detail(&["createdAt", "createTime"]).or_else(|| {
+            subscription_event_time(
+                events,
+                &[
+                    LifecycleEventKind::SubscriptionOpened,
+                    LifecycleEventKind::SubscriptionCreated,
+                ],
+            )
+        }),
+        accept_deadline_at: from_detail(&["acceptDeadline", "acceptExpireTime", "expireTime"]),
+        accepted_at: from_detail(&["acceptedAt", "acceptTime"]).or_else(|| {
+            subscription_event_time(
+                events,
+                &[
+                    LifecycleEventKind::SubscriptionCreated,
+                    LifecycleEventKind::SubscriptionAspSelected,
+                ],
+            )
+        }),
+        trial_started_at: from_detail(&["trialStartTime", "trailStartTime"]),
+        trial_ends_at: from_detail(&["trialEndTime", "trailEndTime"]),
+        trial_converted_at: subscription_event_time(
+            events,
+            &[LifecycleEventKind::SubscriptionTrialConverted],
+        ),
+        current_period_started_at: from_detail(&["subStartTime", "periodStart"]),
+        current_period_ends_at: from_detail(&["subEndTime", "periodEnd"]),
+        grace_period_ends_at: from_detail(&["subBufferEndTime", "graceEndsAt"]),
+        next_charge_at: from_detail(&["nextChargeAt", "nextChargeTime"]),
+        last_renewed_at: subscription_last_event_time(
+            events,
+            &[LifecycleEventKind::SubscriptionRenewed],
+        ),
+        renewal_warning_at: subscription_last_event_time(
+            events,
+            &[LifecycleEventKind::SubscriptionExpiryWarning],
+        ),
+        cancellation_requested_at: subscription_last_event_time(
+            events,
+            &[LifecycleEventKind::SubscriptionCancelled],
+        ),
+        rejected_at: from_detail(&["rejectedAt", "rejectTime"]).or_else(|| {
+            subscription_event_time(events, &[LifecycleEventKind::SubscriptionDeliveryRejected])
+        }),
+        disputed_at: from_detail(&["disputedAt", "disputeTime"]).or_else(|| {
+            subscription_event_time(events, &[LifecycleEventKind::SubscriptionDisputed])
+        }),
+        completed_at: from_detail(&["completedAt", "completeTime"]).or_else(|| {
+            subscription_event_time(events, &[LifecycleEventKind::SubscriptionCompleted])
+        }),
+        closed_at: from_detail(&["closedAt", "closeTime"])
+            .or_else(|| subscription_event_time(events, &[LifecycleEventKind::SubscriptionClosed])),
+        expired_at: from_detail(&["expiredAt"]),
+        // A refund-related event or Failed status alone is not settlement
+        // evidence. Only the authoritative detail may supply the completion
+        // time used by the lifecycle projection.
+        refunded_at: from_detail(&["refundedAt", "refundTime"]),
+    }
+}
+
+fn build_subscription_display(
+    phase: LifecyclePhase,
+    template_number: Option<u8>,
+    current_summary: &str,
+    handled_by: &str,
+    next: &str,
+) -> LifecycleDisplay {
+    let standard = |markers: [&str; 4]| {
+        let creation_title = if markers[0] == "▶" {
+            "Task creation in progress"
+        } else {
+            "Task creation"
+        };
+        let acceptance_title = match markers[1] {
+            "▶" => "ASP acceptance decision pending",
+            "✓" => "ASP accepted",
+            _ => "ASP acceptance",
+        };
+        let service_title = match markers[2] {
+            "▶" => "ASP providing service",
+            "✓" => "ASP provided service",
+            _ => "ASP service",
+        };
+        vec![
+            node(markers[0], "created", creation_title, None),
+            node(markers[1], "accepted", acceptance_title, None),
+            node(markers[2], "service", service_title, None),
+            node(markers[3], "ended", "Subscription end", None),
+        ]
+    };
+    let closed_before_service = |middle: &str| {
+        vec![
+            node("✓", "created", "Task creation", None),
+            node("✓", "pre_service_result", middle, None),
+            node("✓", "closed", "Task closed", None),
+        ]
+    };
+    let refund = |fourth: &str| {
+        vec![
+            node("✓", "created", "Task creation", None),
+            node("✓", "accepted", "ASP acceptance", None),
+            node("✓", "service", "ASP service provided", None),
+            node(
+                if matches!(template_number, Some(14 | 16)) {
+                    "▶"
+                } else {
+                    "✓"
+                },
+                "refund_or_evaluation",
+                fourth,
+                None,
+            ),
+            node(
+                if matches!(template_number, Some(14 | 16)) {
+                    "○"
+                } else {
+                    "✓"
+                },
+                "closed",
+                "Task closed",
+                None,
+            ),
+        ]
+    };
+
+    let (progress_step, progress_total, timeline) = match template_number {
+        Some(1) => (1, 4, standard(["▶", "○", "○", "○"])),
+        Some(2) => (2, 4, standard(["✓", "▶", "○", "○"])),
+        Some(3 | 4 | 5 | 11) => (3, 4, standard(["✓", "✓", "▶", "○"])),
+        Some(6) => (3, 3, closed_before_service("ASP declined")),
+        Some(7) => (3, 3, closed_before_service("ASP acceptance timed out")),
+        Some(8) => (3, 3, closed_before_service("User closed task")),
+        Some(9 | 10 | 12 | 13) => (4, 4, standard(["✓", "✓", "✓", "✓"])),
+        Some(14) => (4, 5, refund("Refund request processing")),
+        Some(15) => (5, 5, refund("Refund request completed")),
+        Some(16) => (4, 5, refund("Refund request under evaluation")),
+        Some(17) => (5, 5, refund("Refund request completed (user won)")),
+        Some(18) => (5, 5, refund("Refund request completed (ASP won)")),
+        _ if phase == LifecyclePhase::Failed => (4, 4, standard(["✓", "✓", "✓", "✓"])),
+        _ => (
+            1,
+            4,
+            standard([
+                if phase == LifecyclePhase::Initializing {
+                    "▶"
+                } else {
+                    "○"
+                },
+                "○",
+                "○",
+                "○",
+            ]),
+        ),
+    };
+    let choices = if template_number == Some(2) {
+        vec![
+            "Continue waiting for ASP acceptance".to_string(),
+            "Close task".to_string(),
+        ]
+    } else {
+        Vec::new()
+    };
+    let notice = matches!(template_number, Some(3 | 4 | 5 | 13 | 17 | 18))
+        .then_some("To rate this task, reply \"Rate job\".".to_string());
+
+    LifecycleDisplay {
+        template_id: template_number.map(|number| format!("Sub-Status-{number}")),
+        progress_step,
+        progress_total,
+        deliverable_available: false,
+        review_ready: false,
+        timeline,
+        follow_up: Vec::new(),
+        choices,
+        current_summary: current_summary.to_string(),
+        handled_by: handled_by.to_string(),
+        next: next.to_string(),
+        notice,
+    }
 }
 
 fn project_task_detail(detail: &Value) -> TaskDetailProjection {
@@ -422,9 +1276,18 @@ pub(crate) fn events_from_history(
             .iter()
             .find_map(|key| envelope.get(*key).and_then(scalar_string))
             .or_else(|| message.sent_at.clone());
-        let deadline_at = ["reviewDeadlineAt", "reviewWindowEndsAt", "expireTime"]
-            .iter()
-            .find_map(|key| envelope.get(*key).and_then(scalar_string));
+        let deadline_at = [
+            "reviewDeadlineAt",
+            "reviewWindowEndsAt",
+            "rejectWindowEndsAt",
+            "acceptDeadline",
+            "trialEndTime",
+            "trailEndTime",
+            "subBufferEndTime",
+            "expireTime",
+        ]
+        .iter()
+        .find_map(|key| envelope.get(*key).and_then(scalar_string));
         let event_id = envelope.get("eventId").and_then(scalar_string);
         let event_name = event_name.trim().to_ascii_lowercase();
         let logical_key = event_id.clone().unwrap_or_else(|| {
@@ -436,6 +1299,31 @@ pub(crate) fn events_from_history(
         if !seen_events.insert(logical_key) {
             continue;
         }
+        let inferred_job_type = envelope
+            .get("jobType")
+            .and_then(parse_job_type)
+            .or_else(|| event_name.starts_with("sub_").then_some(1));
+        let outcome = [
+            "renewResult",
+            "cancelResult",
+            "disputeResult",
+            "evaluationResult",
+            "winner",
+            "verdict",
+            "result",
+        ]
+        .iter()
+        .find_map(|key| envelope.get(*key).and_then(scalar_string));
+        let reason = [
+            "failReason",
+            "failReasopn",
+            "aspRejectReason",
+            "refundReason",
+            "rejectReason",
+            "reason",
+        ]
+        .iter()
+        .find_map(|key| envelope.get(*key).and_then(scalar_string));
         events.push(LifecycleEvent {
             message_id: message.id.clone(),
             event_id,
@@ -443,10 +1331,12 @@ pub(crate) fn events_from_history(
             kind,
             occurred_at,
             deadline_at,
-            authoritative_status: ["jobStatus", "taskStatus", "status"]
+            authoritative_status: ["subStatus", "jobStatus", "taskStatus", "status"]
                 .iter()
                 .find_map(|key| envelope.get(*key).and_then(scalar_string)),
-            job_type: envelope.get("jobType").and_then(parse_job_type),
+            job_type: inferred_job_type,
+            outcome,
+            reason,
             sender_inbox_id: message.sender_inbox_id.clone(),
         });
     }
@@ -497,6 +1387,21 @@ fn event_kind(name: &str) -> Option<LifecycleEventKind> {
             LifecycleEventKind::Refunded
         }
         "job_failed" => LifecycleEventKind::Failed,
+        "sub_open" => LifecycleEventKind::SubscriptionOpened,
+        "sub_created" => LifecycleEventKind::SubscriptionCreated,
+        "sub_asp_selected" => LifecycleEventKind::SubscriptionAspSelected,
+        "sub_cancel" => LifecycleEventKind::SubscriptionCancelled,
+        "sub_user_reject" => LifecycleEventKind::SubscriptionDeliveryRejected,
+        "sub_asp_agree" => LifecycleEventKind::SubscriptionRefundApproved,
+        "sub_asp_dispute" => LifecycleEventKind::SubscriptionDisputed,
+        "sub_trial_into_active" => LifecycleEventKind::SubscriptionTrialConverted,
+        "sub_renew" => LifecycleEventKind::SubscriptionRenewed,
+        "sub_expire_warn" => LifecycleEventKind::SubscriptionExpiryWarning,
+        "sub_complete_notify" => LifecycleEventKind::SubscriptionCompleted,
+        "sub_close_notify" => LifecycleEventKind::SubscriptionClosed,
+        "sub_failed_notify" => LifecycleEventKind::SubscriptionFailed,
+        "sub_reject_refund_notify" => LifecycleEventKind::SubscriptionAutoRefunded,
+        "sub_asp_claim_notify" => LifecycleEventKind::SubscriptionIncomeClaimed,
         _ => return None,
     })
 }
@@ -578,6 +1483,12 @@ fn snapshot_from_local_fallback(job_id: &str, local: &LocalHistoryRead) -> Lifec
     if task_type != Some(0) || status.is_none() {
         let mut snapshot =
             unavailable_snapshot(job_id, "Verified local task history is incomplete.");
+        snapshot.task_type = match task_type {
+            Some(1) => "subscription",
+            Some(_) => "unsupported",
+            None => "unknown",
+        }
+        .to_string();
         snapshot.history_read_succeeded = local.read_succeeded;
         snapshot.history_available = !events.is_empty();
         snapshot.history_event_count = events.len();
@@ -632,7 +1543,22 @@ fn status_from_event(event: &LifecycleEvent) -> Option<Status> {
         LifecycleEventKind::Closed => Status::Close,
         LifecycleEventKind::Expired => Status::Expired,
         LifecycleEventKind::Refunded | LifecycleEventKind::Failed => Status::Failed,
-        LifecycleEventKind::DisputeResolved => return None,
+        LifecycleEventKind::DisputeResolved
+        | LifecycleEventKind::SubscriptionOpened
+        | LifecycleEventKind::SubscriptionCreated
+        | LifecycleEventKind::SubscriptionAspSelected
+        | LifecycleEventKind::SubscriptionCancelled
+        | LifecycleEventKind::SubscriptionDeliveryRejected
+        | LifecycleEventKind::SubscriptionRefundApproved
+        | LifecycleEventKind::SubscriptionDisputed
+        | LifecycleEventKind::SubscriptionTrialConverted
+        | LifecycleEventKind::SubscriptionRenewed
+        | LifecycleEventKind::SubscriptionExpiryWarning
+        | LifecycleEventKind::SubscriptionCompleted
+        | LifecycleEventKind::SubscriptionClosed
+        | LifecycleEventKind::SubscriptionFailed
+        | LifecycleEventKind::SubscriptionAutoRefunded
+        | LifecycleEventKind::SubscriptionIncomeClaimed => return None,
     })
 }
 
@@ -657,6 +1583,9 @@ fn responsible_party(phase: LifecyclePhase) -> &'static str {
     match phase {
         LifecyclePhase::Initializing => "official",
         LifecyclePhase::WaitingForAsp | LifecyclePhase::AspExecuting => "asp",
+        LifecyclePhase::FreeTrial | LifecyclePhase::ActiveSubscription => "asp",
+        LifecyclePhase::RenewalGracePeriod => "user",
+        LifecyclePhase::AwaitingAspDecision => "asp",
         LifecyclePhase::WaitingForUserReview | LifecyclePhase::Rejected => "user",
         LifecyclePhase::Disputed | LifecyclePhase::Unknown => "official",
         LifecyclePhase::Completed
@@ -672,6 +1601,10 @@ fn next_action(phase: LifecyclePhase) -> &'static str {
         LifecyclePhase::Initializing => "Wait for task initialization",
         LifecyclePhase::WaitingForAsp => "Wait for the ASP to accept the task",
         LifecyclePhase::AspExecuting => "Wait for the ASP to submit the deliverable",
+        LifecyclePhase::FreeTrial => "Use the service or cancel before the trial ends",
+        LifecyclePhase::ActiveSubscription => "Continue using the subscription service",
+        LifecyclePhase::RenewalGracePeriod => "Fund the wallet before the grace period ends",
+        LifecyclePhase::AwaitingAspDecision => "Wait for the ASP refund decision",
         LifecyclePhase::WaitingForUserReview => "Review the ASP deliverable",
         LifecyclePhase::Rejected => "Wait for the ASP response or platform review",
         LifecyclePhase::Disputed => "Wait for the platform review result",
@@ -765,6 +1698,21 @@ fn fold_milestones(events: &[LifecycleEvent]) -> Milestones {
             LifecycleEventKind::Expired => &mut result.expired_at,
             LifecycleEventKind::Refunded => &mut result.refunded_at,
             LifecycleEventKind::Failed => &mut result.failed_at,
+            LifecycleEventKind::SubscriptionOpened
+            | LifecycleEventKind::SubscriptionCreated
+            | LifecycleEventKind::SubscriptionAspSelected
+            | LifecycleEventKind::SubscriptionCancelled
+            | LifecycleEventKind::SubscriptionDeliveryRejected
+            | LifecycleEventKind::SubscriptionRefundApproved
+            | LifecycleEventKind::SubscriptionDisputed
+            | LifecycleEventKind::SubscriptionTrialConverted
+            | LifecycleEventKind::SubscriptionRenewed
+            | LifecycleEventKind::SubscriptionExpiryWarning
+            | LifecycleEventKind::SubscriptionCompleted
+            | LifecycleEventKind::SubscriptionClosed
+            | LifecycleEventKind::SubscriptionFailed
+            | LifecycleEventKind::SubscriptionAutoRefunded
+            | LifecycleEventKind::SubscriptionIncomeClaimed => continue,
         };
         if slot.is_none() {
             *slot = event.occurred_at.clone();
@@ -833,9 +1781,7 @@ fn review_deadline(
         .submitted_at
         .as_deref()
         .and_then(super::deadline::parse_timestamp_seconds)
-        .and_then(|submitted| {
-            submitted.checked_add(super::deadline::REVIEW_WINDOW_SECONDS)
-        })
+        .and_then(|submitted| submitted.checked_add(super::deadline::REVIEW_WINDOW_SECONDS))
 }
 
 fn timestamp_sort_key(value: Option<&str>) -> (bool, i64, &str) {
@@ -1331,10 +2277,7 @@ fn build_display(
                     "—",
                     "asp_execution",
                     "ASP execution ended",
-                    Some(time_range(
-                        milestones.accepted_at.as_deref(),
-                        refund_time,
-                    )),
+                    Some(time_range(milestones.accepted_at.as_deref(), refund_time)),
                 )
             } else {
                 pending_node("asp_execution", "ASP execution")
@@ -1460,7 +2403,11 @@ fn build_display(
                 "No further action",
             )
         }
-        LifecyclePhase::Unknown => (
+        LifecyclePhase::FreeTrial
+        | LifecyclePhase::ActiveSubscription
+        | LifecyclePhase::RenewalGracePeriod
+        | LifecyclePhase::AwaitingAspDecision
+        | LifecyclePhase::Unknown => (
             1,
             vec![
                 pending_node("created", "Task creation"),
@@ -1477,6 +2424,7 @@ fn build_display(
     };
 
     LifecycleDisplay {
+        template_id: None,
         progress_step,
         progress_total: 5,
         deliverable_available,
@@ -1485,6 +2433,7 @@ fn build_display(
             && milestones.review_expired_at.is_none(),
         timeline,
         follow_up,
+        choices: Vec::new(),
         current_summary: current_summary.to_string(),
         handled_by: handled_by.to_string(),
         next: next.to_string(),
@@ -1918,7 +2867,10 @@ mod tests {
                 ),
             ],
         );
-        assert_eq!(resolved.display.follow_up[0].title, "Platform review completed");
+        assert_eq!(
+            resolved.display.follow_up[0].title,
+            "Platform review completed"
+        );
         assert_eq!(resolved.display.follow_up[0].marker, "✓");
     }
 
@@ -1933,9 +2885,18 @@ mod tests {
                 "40",
             )],
         );
-        assert_eq!(snapshot.display.timeline[1].detail.as_deref(), Some("Not started"));
-        assert_eq!(snapshot.display.timeline[2].detail.as_deref(), Some("Not started"));
-        assert_eq!(snapshot.display.timeline[3].detail.as_deref(), Some("Not started"));
+        assert_eq!(
+            snapshot.display.timeline[1].detail.as_deref(),
+            Some("Not started")
+        );
+        assert_eq!(
+            snapshot.display.timeline[2].detail.as_deref(),
+            Some("Not started")
+        );
+        assert_eq!(
+            snapshot.display.timeline[3].detail.as_deref(),
+            Some("Not started")
+        );
     }
 
     #[test]
@@ -2008,8 +2969,14 @@ mod tests {
     #[test]
     fn incomplete_final_node_differs_from_other_future_nodes() {
         let snapshot = build_snapshot("j", &Status::Accepted, &[]);
-        assert_eq!(snapshot.display.timeline[3].detail.as_deref(), Some("Not started"));
-        assert_eq!(snapshot.display.timeline[4].detail.as_deref(), Some("Not completed"));
+        assert_eq!(
+            snapshot.display.timeline[3].detail.as_deref(),
+            Some("Not started")
+        );
+        assert_eq!(
+            snapshot.display.timeline[4].detail.as_deref(),
+            Some("Not completed")
+        );
     }
 
     #[test]
@@ -2195,6 +3162,411 @@ mod tests {
         let read = read_scoped_local_history_at(temp.path(), &database, "job-1", "user-1");
         assert!(!read.read_succeeded);
         assert!(read.messages.is_empty());
+    }
+
+    #[test]
+    fn subscription_projection_distinguishes_trial_active_and_grace_period() {
+        let trial = build_subscription_snapshot(
+            "sub-1",
+            &json!({
+                "jobId":"sub-1", "status":1, "trialType":1, "autoRenew":1,
+                "trialStartTime":1_800_000_000i64, "trialEndTime":1_800_259_200i64,
+                "providerAgentId":"2002"
+            }),
+            Vec::new(),
+            true,
+        );
+        assert_eq!(trial.phase, LifecyclePhase::FreeTrial);
+        assert_eq!(trial.responsible_party, "asp");
+        assert_eq!(trial.display.template_id.as_deref(), Some("Sub-Status-3"));
+        assert_eq!(trial.display.progress_total, 4);
+        assert_eq!(trial.display.timeline[2].marker, "▶");
+        assert_eq!(trial.display.timeline[2].title, "ASP providing service");
+        assert_eq!(trial.display.timeline[3].marker, "○");
+
+        let active = build_subscription_snapshot(
+            "sub-2",
+            &json!({
+                "jobId":"sub-2", "status":1, "trialType":0, "autoRenew":0,
+                "subStartTime":1_800_000_000i64, "subEndTime":1_802_592_000i64
+            }),
+            Vec::new(),
+            true,
+        );
+        assert_eq!(active.phase, LifecyclePhase::ActiveSubscription);
+        assert_eq!(active.display.template_id.as_deref(), Some("Sub-Status-5"));
+        assert_eq!(
+            active.status_label,
+            "Subscription active; auto-renewal disabled"
+        );
+        assert!(active.next_action.contains("Enable auto-renewal"));
+
+        let grace = build_subscription_snapshot(
+            "sub-3",
+            &json!({
+                "jobId":"sub-3", "status":1, "trialType":0, "autoRenew":1,
+                "subEndTime":1_700_000_000i64, "subBufferEndTime":2_000_000_000i64
+            }),
+            Vec::new(),
+            true,
+        );
+        assert_eq!(grace.phase, LifecyclePhase::RenewalGracePeriod);
+        assert_eq!(grace.display.template_id.as_deref(), Some("Sub-Status-11"));
+        assert_eq!(grace.responsible_party, "user");
+    }
+
+    #[test]
+    fn subscription_projection_covers_refund_and_evaluation_branches() {
+        for (status, expected) in [
+            (0, LifecyclePhase::WaitingForAsp),
+            (3, LifecyclePhase::AwaitingAspDecision),
+            (4, LifecyclePhase::Disputed),
+            (6, LifecyclePhase::Completed),
+            (7, LifecyclePhase::Closed),
+            (8, LifecyclePhase::Expired),
+        ] {
+            let snapshot = build_subscription_snapshot(
+                "sub-state",
+                &json!({"jobId":"sub-state", "status":status}),
+                Vec::new(),
+                true,
+            );
+            assert_eq!(snapshot.phase, expected, "status={status}");
+        }
+
+        let unverified = build_subscription_snapshot(
+            "sub-failed",
+            &json!({"jobId":"sub-failed", "status":9}),
+            Vec::new(),
+            true,
+        );
+        assert_eq!(unverified.phase, LifecyclePhase::Failed);
+        assert!(unverified.status_label.contains("reconciliation"));
+        assert!(unverified.display.template_id.is_none());
+        assert_eq!(unverified.display.progress_step, 4);
+
+        let formal_refund = build_subscription_snapshot(
+            "sub-formal-refund",
+            &json!({
+                "jobId":"sub-formal-refund", "status":9, "trialType":0,
+                "paymentTokenAmount":"10.00", "paymentTokenSymbol":"USDT"
+            }),
+            Vec::new(),
+            true,
+        );
+        assert_eq!(formal_refund.phase, LifecyclePhase::Refunded);
+        assert_eq!(
+            formal_refund.display.template_id.as_deref(),
+            Some("Sub-Status-15")
+        );
+        assert_eq!(formal_refund.display.progress_step, 5);
+
+        let refunded = build_subscription_snapshot(
+            "sub-refunded",
+            &json!({
+                "jobId":"sub-refunded", "status":9,
+                "refundedAt":1_800_000_000i64, "refundTxHash":"0xabc"
+            }),
+            Vec::new(),
+            true,
+        );
+        assert_eq!(refunded.phase, LifecyclePhase::Refunded);
+        assert_eq!(
+            refunded.display.template_id.as_deref(),
+            Some("Sub-Status-15")
+        );
+        assert_eq!(refunded.status_label, "Refund completed; task closed");
+
+        let accept_expired = build_subscription_snapshot(
+            "sub-expired",
+            &json!({"jobId":"sub-expired", "status":8}),
+            Vec::new(),
+            true,
+        );
+        assert_eq!(
+            accept_expired.display.template_id.as_deref(),
+            Some("Sub-Status-7")
+        );
+        assert_eq!(accept_expired.display.progress_total, 3);
+
+        let user_closed_expired = build_subscription_snapshot_with_user_close(
+            "sub-user-closed",
+            &json!({"jobId":"sub-user-closed", "status":8}),
+            Vec::new(),
+            true,
+            true,
+        );
+        assert_eq!(
+            user_closed_expired.display.template_id.as_deref(),
+            Some("Sub-Status-8")
+        );
+        assert_eq!(user_closed_expired.status_label, "User closed the task");
+
+        let awaiting = build_subscription_snapshot(
+            "sub-awaiting",
+            &json!({"jobId":"sub-awaiting", "status":0, "acceptDeadline":2_000_000_000i64}),
+            Vec::new(),
+            true,
+        );
+        assert_eq!(
+            awaiting.display.template_id.as_deref(),
+            Some("Sub-Status-2")
+        );
+        assert_eq!(awaiting.display.timeline[1].marker, "▶");
+        assert_eq!(awaiting.display.choices.len(), 2);
+
+        let close_pending = build_subscription_snapshot_with_user_close(
+            "sub-awaiting",
+            &json!({"jobId":"sub-awaiting", "status":0, "acceptDeadline":2_000_000_000i64}),
+            Vec::new(),
+            true,
+            true,
+        );
+        assert_eq!(
+            close_pending.display.template_id.as_deref(),
+            Some("Sub-Status-2")
+        );
+        assert_eq!(close_pending.status_label, "Subscription closure submitted");
+        assert_eq!(close_pending.responsible_party, "platform");
+        assert_eq!(
+            close_pending.display.current_summary,
+            "Subscription closure submitted"
+        );
+        assert_eq!(close_pending.display.handled_by, "platform");
+        assert!(close_pending
+            .display
+            .next
+            .contains("wallet order to confirm the closure"));
+        assert!(close_pending.display.choices.is_empty());
+        assert!(close_pending
+            .display
+            .notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("Do not submit another close request")));
+    }
+
+    #[test]
+    fn subscription_template_selector_covers_all_eighteen_approved_copy_branches() {
+        fn events(name: &str) -> Vec<LifecycleEvent> {
+            events_from_history(
+                "sub-template",
+                &[message(
+                    name,
+                    json!({
+                        "source":"system", "event":name,
+                        "jobId":"sub-template", "timestamp":1_800_000_000i64
+                    }),
+                    "1800000000",
+                )],
+            )
+        }
+
+        let empty = SubscriptionMilestones::default();
+        let mut accepted = SubscriptionMilestones::default();
+        accepted.accepted_at = Some("1800000000".to_string());
+        let mut grace_ended = accepted.clone();
+        grace_ended.grace_period_ends_at = Some("1700000000".to_string());
+        let cancelled = events("sub_cancel");
+        let disputed = events("sub_asp_dispute");
+
+        let cases = [
+            (Some(-1), None, None, false, false, &empty, &[][..], Some(1)),
+            (Some(0), None, None, false, false, &empty, &[][..], Some(2)),
+            (
+                Some(1),
+                Some(1),
+                Some(1),
+                false,
+                false,
+                &accepted,
+                &[][..],
+                Some(3),
+            ),
+            (
+                Some(1),
+                Some(0),
+                Some(1),
+                false,
+                false,
+                &accepted,
+                &[][..],
+                Some(4),
+            ),
+            (
+                Some(1),
+                Some(0),
+                Some(0),
+                false,
+                false,
+                &accepted,
+                &[][..],
+                Some(5),
+            ),
+            (
+                Some(7),
+                Some(0),
+                None,
+                false,
+                false,
+                &empty,
+                &[][..],
+                Some(6),
+            ),
+            (
+                Some(8),
+                Some(0),
+                None,
+                false,
+                false,
+                &empty,
+                &[][..],
+                Some(7),
+            ),
+            (
+                Some(7),
+                Some(0),
+                None,
+                false,
+                false,
+                &empty,
+                &cancelled,
+                Some(8),
+            ),
+            (
+                Some(9),
+                Some(1),
+                None,
+                false,
+                false,
+                &accepted,
+                &[][..],
+                Some(9),
+            ),
+            (
+                Some(7),
+                Some(1),
+                None,
+                false,
+                false,
+                &accepted,
+                &cancelled,
+                Some(10),
+            ),
+            (
+                Some(1),
+                Some(0),
+                Some(1),
+                true,
+                false,
+                &accepted,
+                &[][..],
+                Some(11),
+            ),
+            (
+                Some(7),
+                Some(0),
+                Some(1),
+                false,
+                false,
+                &grace_ended,
+                &[][..],
+                Some(12),
+            ),
+            (
+                Some(6),
+                Some(0),
+                None,
+                false,
+                false,
+                &accepted,
+                &[][..],
+                Some(13),
+            ),
+            (
+                Some(3),
+                Some(0),
+                None,
+                false,
+                false,
+                &accepted,
+                &[][..],
+                Some(14),
+            ),
+            (
+                Some(9),
+                Some(0),
+                None,
+                false,
+                true,
+                &accepted,
+                &[][..],
+                Some(15),
+            ),
+            (
+                Some(4),
+                Some(0),
+                None,
+                false,
+                false,
+                &accepted,
+                &disputed,
+                Some(16),
+            ),
+            (
+                Some(9),
+                Some(0),
+                None,
+                false,
+                true,
+                &accepted,
+                &disputed,
+                Some(17),
+            ),
+            (
+                Some(6),
+                Some(0),
+                None,
+                false,
+                false,
+                &accepted,
+                &disputed,
+                Some(18),
+            ),
+        ];
+
+        for (status, trial, renew, grace, refunded, milestones, history, expected) in cases {
+            assert_eq!(
+                subscription_template_number(
+                    status, trial, renew, grace, refunded, milestones, history, false
+                ),
+                expected
+            );
+        }
+
+        assert_eq!(
+            subscription_template_number(Some(7), Some(0), None, false, false, &empty, &[], true,),
+            Some(8),
+            "a durable local Created-subscription close receipt fills the event propagation gap"
+        );
+    }
+
+    #[test]
+    fn subscription_history_recognizes_official_sub_events() {
+        let rows = vec![message(
+            "m-sub",
+            json!({
+                "source":"system", "event":"sub_trial_into_active",
+                "jobId":"sub-1", "timestamp":1_800_000_000i64
+            }),
+            "1800000000",
+        )];
+        let events = events_from_history("sub-1", &rows);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].job_type, Some(1));
+        assert_eq!(
+            events[0].kind,
+            LifecycleEventKind::SubscriptionTrialConverted
+        );
     }
 
     #[cfg(unix)]

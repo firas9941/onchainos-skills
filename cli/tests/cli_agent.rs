@@ -493,7 +493,8 @@ fn funding_notice_outputs_canonical_json_and_png() {
         "2. Swap",
         "3. Bridge",
         "4. Withdraw from OKX",
-        "Gas is paid by the platform",
+        "The exchange may charge a withdrawal fee",
+        "On-chain gas on X Layer is free after the funds arrive",
         "After topping up, tell me \"I topped up\".",
     ] {
         assert!(
@@ -557,7 +558,7 @@ fn funding_notice_unknown_chain_does_not_claim_gas_subsidy() {
     assert!(content.contains("Insufficient USDC balance on Base"));
     assert!(content.contains("2.5 USDC"));
     assert!(content.contains("Ensure the wallet meets the network gas requirements."));
-    assert!(!content.contains("Gas is paid by the platform"));
+    assert!(!content.contains("is paid by the platform"));
 
     let image_path = data["imagePath"].as_str().expect("imagePath");
     let _ = fs::remove_file(image_path);

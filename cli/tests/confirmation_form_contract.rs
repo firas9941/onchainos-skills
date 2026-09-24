@@ -32,7 +32,7 @@ const RECOVERY: &str = include_str!("../../skills/okx-ai/references/runtime/reco
 #[test]
 fn v2_uses_role_scoped_lazy_routing() {
     assert!(SKILL.contains("references/a2a/router.md"));
-    assert!(SKILL.contains("Select exactly one row"));
+    assert!(SKILL.contains("select exactly one row"));
     assert!(SKILL.contains("re-enter this Skill or the A2A parent router"));
     assert!(IDENTITY_SEARCH.contains("Do not load any A2A creation"));
     assert!(IDENTITY_SEARCH.contains("../a2a/user/create-prepare.md"));
@@ -119,10 +119,31 @@ fn create_confirmation_omits_follow_trade_configuration() {
     assert!(subscription_create.contains("One-time tasks never configure automatic copy-trading"));
     assert!(!SUBSCRIPTION_CREATE.contains("Guide Consent remains a separate confirmation"));
     let subscription_detail = SUBSCRIPTION_QUERY.split_once("## Detail").unwrap().1;
-    assert!(subscription_detail.contains("- Job ID: {jobId}"));
-    assert!(subscription_detail.contains("- Status: {localizedStatusLabel}"));
-    assert!(subscription_detail.contains("- Status Description: {localizedStatusDescription}"));
-    assert!(SUBSCRIPTION_QUERY.contains("use `Refund completed`"));
+    assert!(subscription_detail.contains("This is the Buyer-side detail card"));
+    assert!(subscription_detail.contains("[`../provider/task-query.md`](../provider/task-query.md)"));
+    assert!(subscription_detail.contains("### Subscription Details · {jobId}"));
+    assert!(subscription_detail.contains("- Job Name: {title, when non-empty}"));
+    assert!(subscription_detail.contains("- Job Description: {description, when non-empty}"));
+    assert!(subscription_detail
+        .contains("- Service Provider: {serviceProviderLabel, when non-null}"));
+    assert!(subscription_detail
+        .contains("- Free Trial: {localized freeTrialLabel, when non-null}"));
+    assert!(subscription_detail.contains("- Fee: {localized feeLabel, when non-null}"));
+    assert!(subscription_detail
+        .contains("- Auto-Renewal: {localized autoRenewLabel, when non-null}"));
+    assert!(subscription_detail
+        .contains("- Billing Period: {localized billingPeriodLabel, when non-null}"));
+    assert!(subscription_detail
+        .contains("- Current Period: {currentPeriodLabel, when non-null}"));
+    assert!(subscription_detail.contains(
+        "- Offline Message Handling: {localized offlineMessageHandlingLabel, when non-null}"
+    ));
+    assert!(subscription_detail.contains(
+        "- Receive on This Device: {localized receiveOnThisDeviceLabel, when non-null}"
+    ));
+    assert!(subscription_detail.contains("must not suppress the remaining card"));
+    assert!(subscription_detail.contains("Keep the detail layout vertical"));
+    assert!(!subscription_detail.contains("- Status:"));
     assert!(!subscription_detail.contains("| Job Name |"));
     assert!(create.contains("Keep Guide Consent in its separate confirmation"));
 }
@@ -185,6 +206,12 @@ fn refund_finality_and_display_remain_exact() {
     assert!(REFUND_CONFIRM.contains("include your refund reason"));
     assert!(REFUND_CONFIRM.contains("Render the complete [Confirm Refund Request]"));
     assert!(REFUND_CONFIRM.contains("preceding `B` or rejection enters"));
+    assert!(REFUND_CONFIRM.contains("### Confirm Subscription Closure"));
+    assert!(REFUND_CONFIRM.contains("do not use a horizontal table"));
+    assert!(REFUND_CONTRACT.contains("close-created-subscription"));
+    assert!(REFUND_CONTRACT.contains("successful wallet order"));
+    assert!(SUBSCRIPTION_MANAGE.contains("fresh status is Created(0)"));
+    assert!(SUBSCRIPTION_MANAGE.contains("`close_created_subscription` action"));
     assert!(TASK_QUERY.contains("## Output Templates"));
     assert!(TASK_QUERY.contains("### Refund Task List"));
     assert!(TASK_QUERY.contains("### Refund Request Details"));

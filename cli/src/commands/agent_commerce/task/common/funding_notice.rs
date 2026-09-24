@@ -344,7 +344,8 @@ fn render_content(input: &FundingNoticeInput) -> String {
             input.shortfall, input.currency, input.chain
         ),
         format!(
-            "4. Withdraw from OKX — withdraw {} to the address above using the {} network.",
+            "4. Withdraw from OKX — withdraw {} to the address above using the {} network. \
+             The exchange may charge a withdrawal fee.",
             input.currency, input.deposit_chain
         ),
         String::new(),
@@ -364,7 +365,10 @@ fn render_fallback_content(input: &FundingNoticeInput) -> String {
 
 fn gas_line(input: &FundingNoticeInput) -> String {
     if is_x_layer(&input.chain) || is_x_layer(&input.deposit_chain) {
-        "Gas is paid by the platform; no OKB or other native token is required.".to_string()
+        // Gas sponsorship covers only qualifying on-chain transactions after
+        // the funds arrive — never the exchange withdrawal that funds the
+        // wallet (which may carry the exchange's own fee).
+        "On-chain gas on X Layer is free after the funds arrive.".to_string()
     } else {
         "Ensure the wallet meets the network gas requirements.".to_string()
     }
@@ -415,7 +419,7 @@ mod tests {
             input.deposit_chain = chain.to_string();
             assert_eq!(
                 gas_line(&input),
-                "Gas is paid by the platform; no OKB or other native token is required."
+                "On-chain gas on X Layer is free after the funds arrive."
             );
         }
     }

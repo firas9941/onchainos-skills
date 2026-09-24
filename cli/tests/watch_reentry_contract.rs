@@ -97,14 +97,29 @@ fn creation_watch_shows_one_localized_monitoring_note_without_reentry_repeats() 
 }
 
 #[test]
-fn current_task_progress_is_a_complete_lifecycle_query() {
+fn current_task_progress_uses_lifecycle_as_the_task_type_gate() {
     let task_query = include_str!("../../skills/okx-ai/references/a2a/task-query.md");
+    let normalized = task_query.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(task_query.contains("`View task status`"));
     assert!(task_query.contains("equivalent progress/status wording"));
     assert!(task_query.contains("onchainos agent lifecycle <jobId>"));
+    let lifecycle_gate = task_query
+        .split_once("### Lifecycle query and task-type gate")
+        .unwrap()
+        .1
+        .split_once("### One-time lifecycle timeline")
+        .unwrap()
+        .0;
+    assert!(!lifecycle_gate.contains("onchainos agent status <jobId> --agent-id <currentAgentId>"));
+    assert!(normalized.contains("Route the returned `taskType` without rerunning the command"));
+    assert!(task_query.contains("§Subscription lifecycle query"));
+    assert!(task_query.contains(
+        "Use this rendering only when the lifecycle result's `taskType` is `one_time`"
+    ));
     assert!(task_query.contains("current-wallet User identity resolution"));
     assert!(task_query.contains("single unambiguous Job\nID bound to the current conversation"));
     assert!(task_query.contains("run `active-tasks`"));
+    assert!(task_query.contains("combines non-terminal one-time tasks and subscriptions"));
 }
 
 #[test]
@@ -130,11 +145,12 @@ fn lifecycle_follow_up_precedes_the_final_completion_node() {
 
 #[test]
 fn decision_reply_claims_before_relay() {
+    let relay = RELAY.split_whitespace().collect::<Vec<_>>().join(" ");
     let claim = RELAY.find("Otherwise claim first").unwrap();
     let execute = RELAY.find("On `handled`").unwrap();
     assert!(claim < execute);
     assert!(RELAY.contains("execute only the item's `llmContent` commands verbatim"));
-    assert!(RELAY.contains("List-origin items never start watch"));
+    assert!(relay.contains("List-origin items never start watch"));
 }
 
 #[test]

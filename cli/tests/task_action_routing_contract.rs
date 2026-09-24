@@ -25,6 +25,9 @@ const NOTIFY: &str = include_str!("../../skills/okx-ai/references/a2a/notify.md"
 const USER_REVIEW: &str = include_str!("../../skills/okx-ai/references/a2a/user/review.md");
 const USER_SUBSCRIPTION: &str =
     include_str!("../../skills/okx-ai/references/a2a/user/subscription.md");
+const LIFECYCLE_SOURCE: &str =
+    include_str!("../src/commands/agent_commerce/task/common/lifecycle.rs");
+const ARBITRATION_SOURCE: &str = include_str!("../src/commands/agent_commerce/task/arbitration.rs");
 const OKX_AI_SKILL: &str = include_str!("../../skills/okx-ai/SKILL.md");
 const TASK_COMMON_SOURCE: &str = include_str!("../src/commands/agent_commerce/task/common/mod.rs");
 const EVALUATOR_FLOW_SOURCE: &str =
@@ -107,24 +110,44 @@ fn asp_task_query_uses_one_language_neutral_template() {
 
 #[test]
 fn creation_monitoring_query_tips_have_explicit_user_routes() {
-    let lifecycle_route = "Ask about a task's progress, status, lifecycle, timeline, current stage, current responsible party, or next step | [`../task-query.md`](../task-query.md)";
+    let lifecycle_route = "Ask about a task's progress, status, lifecycle, timeline, current stage, current responsible party, or next step when its type is not already known | [`../task-query.md`](../task-query.md)";
     assert!(USER_ROUTER.contains(lifecycle_route));
     let details_route = "Explicitly ask for task details, basic information, attributes, type, fee, provider, description, or delivery content; list or inspect tasks, saved deliverables, pending evaluations, or tasks the User rejected | [`../task-query.md`](../task-query.md)";
     assert!(USER_ROUTER.contains(details_route));
     let subscription_trade_route = "Direct reply to the Runtime Watch creation-start note using `Check subscription task status` or its localized rendering; or query local follow-trade results for a subscription Signal by `jobId` or `deliveryId` | [`subscription-trade-records.md`](subscription-trade-records.md)";
     assert!(USER_ROUTER.contains(subscription_trade_route));
-    let generic_subscription_route = "List, inspect, or manage a subscription | [`subscription.md`](subscription.md) or [`subscription-manage.md`](subscription-manage.md)";
+    let generic_subscription_route = "List or manage subscriptions | [`subscription.md`](subscription.md) or [`subscription-manage.md`](subscription-manage.md)";
     assert!(USER_ROUTER.contains(generic_subscription_route));
     assert!(USER_ROUTER.contains(
-        "All other subscription lifecycle/status wording uses the\ngeneric subscription query"
+        "All other subscription lifecycle/status wording uses the\nsubscription lifecycle query"
     ));
+    assert!(USER_ROUTER.contains("View a known subscription's name, provider, fee, trial"));
+    assert!(USER_ROUTER.contains("View a known subscription's progress, status"));
+    assert!(USER_ROUTER.contains("View or configure subscription receipt devices"));
+    assert!(USER_ROUTER.contains("Receipt/device wording wins over generic"));
+    assert!(USER_ROUTER.contains("execute each required read-only query and combine"));
     let direct_subscription_tip = USER_ROUTER
         .find("Direct reply to the Runtime Watch creation-start note")
         .unwrap();
     let generic_subscription_query = USER_ROUTER
-        .find("List, inspect, or manage a subscription")
+        .find("List or manage subscriptions")
         .unwrap();
     assert!(direct_subscription_tip < generic_subscription_query);
+}
+
+#[test]
+fn subscription_lifecycle_uses_native_read_only_detail_and_full_projection() {
+    assert!(LIFECYCLE_SOURCE.contains("projected.job_type == Some(1)"));
+    assert!(LIFECYCLE_SOURCE.contains("fetch_subscribe_detail_for_agent"));
+    assert!(LIFECYCLE_SOURCE.contains("build_subscription_snapshot"));
+    assert!(LIFECYCLE_SOURCE.contains("LifecyclePhase::FreeTrial"));
+    assert!(LIFECYCLE_SOURCE.contains("LifecyclePhase::ActiveSubscription"));
+    assert!(LIFECYCLE_SOURCE.contains("LifecyclePhase::RenewalGracePeriod"));
+    assert!(LIFECYCLE_SOURCE.contains("LifecyclePhase::AwaitingAspDecision"));
+    assert!(LIFECYCLE_SOURCE.contains("Subscription result needs reconciliation"));
+    assert!(LIFECYCLE_SOURCE.contains("Sub-Status-{number}"));
+    assert!(LIFECYCLE_SOURCE.contains("Some(18)"));
+    assert!(!LIFECYCLE_SOURCE.contains("ensure_subscription_session("));
 }
 
 #[test]
@@ -170,8 +193,8 @@ fn refund_and_evaluation_prompts_collect_inline_or_missing_reasons() {
     assert!(ARBITRATION_DECISION.contains("complete Template 6.4"));
     assert!(ARBITRATION_DECISION.contains("Treat this Template 6.4 view as the ASP confirmation"));
     assert!(ARBITRATION_DECISION.contains("### Seller Refund Rejection"));
-    assert!(ARBITRATION_DECISION.contains("卖方拒绝退款"));
-    assert!(ARBITRATION_DECISION.contains("请补充申请评审的理由"));
+    assert!(ARBITRATION_DECISION.contains("Translate the rejection-card title"));
+    assert!(ARBITRATION_DECISION.contains("Please provide your reason for requesting review"));
 
     assert!(PENDING_V2_SOURCE.contains("both the submission intent and a refund reason"));
     assert!(PENDING_V2_SOURCE.contains("B never counts as submission intent"));
@@ -206,12 +229,17 @@ fn single_record_views_use_field_lists_while_multi_record_queries_keep_tables() 
         .split_once("### Refund Request Details")
         .unwrap()
         .1;
+    let normalized_refund_detail = refund_detail
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     assert!(refund_detail.contains("- Service Name: {serviceName}"));
     assert!(refund_detail.contains("- Refund Result: {localizedStatusLabel}"));
     assert!(refund_detail.contains("- Result Description: {localizedStatusDescription}"));
     assert!(refund_detail.contains("- Evaluation Result: {localizedEvaluationResultDescription}"));
     assert!(refund_detail.contains("- Evaluation Reason: {localizedEvaluationReason}"));
-    assert!(refund_detail.contains("Never treat the original `Reason for Refund` as an evaluation reason."));
+    assert!(normalized_refund_detail
+        .contains("Never treat the original `Reason for Refund` as an evaluation reason."));
     assert!(!refund_detail.contains("| Service Name |"));
 
     assert!(REFUND_CONFIRM.contains("- Job ID: {jobId}"));
@@ -236,36 +264,41 @@ fn single_record_views_use_field_lists_while_multi_record_queries_keep_tables() 
     assert!(!evaluation_detail.contains("| Service Name |"));
 
     assert!(TASK_QUERY
-        .contains("| # | Service Name | Job ID | Task Type | Refund Amount | Response Deadline |"));
+        .contains("| # | Service Name | Job ID | Task Type | Refund Amount | Result Deadline |"));
     assert!(ARBITRATION_QUERY.contains(
         "| # | Service Name | Job ID | Task Type | Requested Refund | Response Deadline |"
     ));
     assert!(ARBITRATION_QUERY
-        .contains("| # | Service Name | Job ID | Status | Evaluation Started | Key Time |"));
+        .contains("| # | Service Name | Job ID | Status | Evaluation Started | Action Deadline |"));
 }
 
 #[test]
 fn task_evaluation_and_refund_statuses_have_localized_business_meaning() {
     let task_query = TASK_QUERY.split_whitespace().collect::<Vec<_>>().join(" ");
     for value in [
-        "证据准备中",
-        "评审中",
-        "已裁决",
-        "尚未产生裁决",
-        "用户胜诉，退款成功",
-        "裁决结果暂无法识别",
-        "评审状态暂不可用",
-        "当前返回信息不足，暂无法确定评审状态",
-        "证据自动收集中，请等候。",
+        "Evidence preparation",
+        "Evaluating",
+        "Decided",
+        "No decision has been produced yet.",
+        "The buyer won; the refund completed.",
+        "A decision was returned by the Evaluation service.",
+        "The Evaluation status is currently unavailable.",
+        "Evidence is collected automatically. Please wait.",
     ] {
         assert!(
-            ARBITRATION_QUERY.contains(value),
-            "missing mapping: {value}"
+            ARBITRATION_SOURCE.contains(value),
+            "missing source status copy: {value}"
         );
     }
+    let arbitration_query = ARBITRATION_QUERY
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(arbitration_query.contains(
+        "Translate `statusLabel`, `statusDescription`, and `verdictDescription` into the conversation language."
+    ));
     assert!(task_query.contains("raw `statusName` remains a protocol compatibility key"));
-    assert!(TASK_QUERY.contains("`Refund completed` -> `退款成功`"));
-    assert!(TASK_QUERY.contains("`Refund not issued` -> `未退款`"));
+    assert!(task_query.contains("use the CLI label `Refund completed` before translating it"));
     assert!(REFUND_RECONCILE.contains("displayed business result is the localized"));
     assert!(ASP_FLOW_SOURCE.contains("Evaluation status: Evidence preparation"));
     assert!(DISPUTE_LIFECYCLE_SOURCE.contains("Evaluation status: Evidence preparation"));
@@ -282,8 +315,9 @@ fn user_facing_statuses_use_cli_labels_across_task_subscription_and_rating_flows
     assert!(OKX_AI_SKILL.contains("CLI-provided `statusLabel` and `statusDescription`"));
     assert!(OKX_AI_SKILL.contains("Never render raw state fields"));
 
-    assert!(TASK_QUERY.contains("`Awaiting ASP acceptance` as `ASP 待接单`"));
-    assert!(TASK_QUERY.contains("`Refund completed` as `退款成功`"));
+    assert!(LIFECYCLE_SOURCE.contains("Waiting for ASP acceptance"));
+    assert!(LIFECYCLE_SOURCE.contains("Refund completed"));
+    assert!(TASK_QUERY.contains("Translate the CLI `statusLabel`"));
 
     assert!(PROVIDER_SUBSCRIPTION.contains("{localizedStatusLabel}"));
     assert!(PROVIDER_SUBSCRIPTION.contains("Do not display raw `status`"));
@@ -293,9 +327,9 @@ fn user_facing_statuses_use_cli_labels_across_task_subscription_and_rating_flows
     assert!(SUBSCRIPTION_RATING.contains("do not display raw `status`"));
     assert!(!SUBSCRIPTION_RATING.contains("render `statusName` verbatim"));
 
-    assert!(DUPLICATE_SUBSCRIPTION.contains("payload.statusLabel"));
-    assert!(DUPLICATE_SUBSCRIPTION.contains("payload.statusDescription"));
-    assert!(DUPLICATE_SUBSCRIPTION.contains("do not display a raw numeric `payload.status`"));
+    assert!(DUPLICATE_SUBSCRIPTION.contains("payload.jobId"));
+    assert!(DUPLICATE_SUBSCRIPTION.contains("payload.restoreListeningAvailable"));
+    assert!(!DUPLICATE_SUBSCRIPTION.contains("payload.status"));
     assert!(!DUPLICATE_SUBSCRIPTION.contains("Map `payload.status` for display"));
 
     assert!(EVALUATOR_DISPUTE_STATUS_SOURCE.contains("Task status: {}"));
@@ -411,7 +445,7 @@ fn task_and_evaluation_query_intents_use_distinct_leaves() {
 #[test]
 fn submitted_one_time_status_recovers_and_displays_the_review_card_directly() {
     assert!(TASK_QUERY.contains("Task type: one_time"));
-    assert!(TASK_QUERY.contains("Task status: submitted"));
+    assert!(TASK_QUERY.contains("Task status: Awaiting buyer review"));
     assert!(!TASK_QUERY.contains("onchainos agent next-action"));
     assert!(
         TASK_QUERY.contains("onchainos agent task-deliverable-list --job-id <jobId> --role user")
@@ -421,10 +455,17 @@ fn submitted_one_time_status_recovers_and_displays_the_review_card_directly() {
     assert!(TASK_QUERY.contains("immediately append the exact same localized"));
     assert!(TASK_QUERY.contains("call `okx-a2a user list` or\n`outdated-list` before rendering"));
     assert!(TASK_QUERY.contains("start or resume a watch"));
-    assert!(USER_SUBSCRIPTION.contains("## Status-query handoff"));
+    assert!(USER_SUBSCRIPTION.contains("## Subscription detail query"));
+    assert!(USER_SUBSCRIPTION.contains("## Subscription lifecycle query"));
+    assert!(USER_SUBSCRIPTION.contains("`Sub-Status-1` through `Sub-Status-18`"));
+    assert!(USER_SUBSCRIPTION.contains("`Sub-Status-8`, never the ASP-declined `Sub-Status-6`"));
+    assert!(USER_SUBSCRIPTION.contains("returns no `Close task` choice"));
+    assert!(USER_SUBSCRIPTION.contains("`display.templateId` to be non-empty"));
+    assert!(USER_SUBSCRIPTION.contains("do not run another command"));
     assert!(USER_SUBSCRIPTION.contains(
-        "Do not run `subscription-list`, `subscribe-detail`, or a one-time timeline"
+        "onchainos agent subscribe-detail <jobId> --format json"
     ));
+    assert!(USER_SUBSCRIPTION.contains("onchainos agent lifecycle <jobId>"));
 
     assert!(USER_REVIEW.contains("okx-a2a user list --job-id <jobId> --all-providers --json"));
     assert!(USER_REVIEW.contains("idempotencyKey` exactly"));
@@ -479,6 +520,7 @@ fn notification_and_refund_actions_are_registered() {
         "prepare_refund",
         "provide_refund_reason",
         "cancel_trial_conversion",
+        "close_created_subscription",
         "close_zero_price",
         "execute_direct_refund",
         "submit_refund_request",
@@ -494,4 +536,5 @@ fn notification_and_refund_actions_are_registered() {
     assert!(ROUTER.contains("payload.schemaVersion=2"));
     assert!(ROUTER.contains("refundContextId"));
     assert!(ROUTER.contains("Never substitute retired"));
+    assert!(USER_ROUTER.contains("`close_created_subscription`"));
 }

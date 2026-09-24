@@ -43,6 +43,8 @@ pub enum RefundOperation {
     RequestRefund,
     /// Cancel trial-to-paid conversion. This is not a refund.
     CancelTrialConversion,
+    /// Close a subscription before ASP acceptance and return any original payment.
+    CloseCreatedSubscription,
 }
 
 impl RefundOperation {
@@ -52,6 +54,7 @@ impl RefundOperation {
             Self::DirectRefund => "direct-refund",
             Self::RequestRefund => "request-refund",
             Self::CancelTrialConversion => "cancel-trial-conversion",
+            Self::CloseCreatedSubscription => "close-created-subscription",
         }
     }
 }
@@ -226,6 +229,29 @@ fn read_pending_mutation(
     }
 }
 
+/// Read-only lifecycle hint that proves this client submitted the explicit
+/// Created-subscription close operation for the same buyer and job. A
+/// pre-write `unknown` journal is deliberately insufficient: only a durable
+/// broadcast receipt (or its later reconciled terminal state) may classify a
+/// Closed(7) subscription as user-initiated while the `sub_cancel` event is
+/// still propagating.
+pub(crate) fn has_created_subscription_close_receipt(job_id: &str, user_agent_id: &str) -> bool {
+    read_pending_mutation(job_id, user_agent_id)
+        .ok()
+        .flatten()
+        .is_some_and(|state| {
+            state.operation == RefundOperation::CloseCreatedSubscription.as_str()
+                && matches!(
+                    state.state.as_str(),
+                    "broadcast_submitted"
+                        | "confirmed"
+                        | "confirmed_without_hash"
+                        | "closed_without_payment"
+                )
+                && has_durable_broadcast_receipt(&state)
+        })
+}
+
 fn pending_mutation_resolved(state: &PendingRefundMutation, snapshot: &RefundSnapshot) -> bool {
     match state.operation.as_str() {
         // A paid direct refund keeps its operation-scoped broadcast receipt
@@ -236,6 +262,14 @@ fn pending_mutation_resolved(state: &PendingRefundMutation, snapshot: &RefundSna
         "close-zero" => matches!(snapshot.status, 1 | 2 | 3 | 4 | 6 | 7 | 8 | 9),
         "request-refund" => matches!(snapshot.status, 3 | 4 | 6 | 7 | 8 | 9),
         "cancel-trial-conversion" => snapshot.status != 1 || snapshot.auto_renew == Some(0),
+        // Terminal Created-subscription closure is reconciled separately so a
+        // paid close cannot discard the wallet-order receipt before its refund
+        // is proven. Any other lifecycle advance makes the Created-only write
+        // unavailable and safely retires the replay guard.
+        "close-created-subscription" => {
+            !matches!(snapshot.status, 0 | 7 | 8)
+                || (matches!(snapshot.status, 7 | 8) && is_zero_decimal(&snapshot.original_amount))
+        }
         // Read-only migration support for journals written by older releases;
         // the operation is no longer exposed or executable.
         "finalize-expired-refund" => true,
@@ -427,6 +461,102 @@ fn direct_refund_provenance_matches(
     {
         return false;
     }
+    true
+}
+
+fn created_subscription_close_provenance_matches(
+    snapshot: &RefundSnapshot,
+    state: &PendingRefundMutation,
+) -> bool {
+    let service_matches = match (state.service_id.as_deref(), snapshot.service_id.as_deref()) {
+        (Some(recorded), Some(fresh)) => recorded == fresh,
+        _ => match (
+            state.service_name.as_deref(),
+            snapshot.service_name.as_deref(),
+        ) {
+            (Some(recorded), Some(fresh)) => recorded == fresh,
+            _ => true,
+        },
+    };
+    let optional_exact_matches = |recorded: Option<&str>, fresh: Option<&str>| {
+        recorded
+            .zip(fresh)
+            .is_none_or(|(recorded, fresh)| recorded == fresh)
+    };
+    let optional_ascii_matches = |recorded: Option<&str>, fresh: Option<&str>| {
+        recorded
+            .zip(fresh)
+            .is_none_or(|(recorded, fresh)| recorded.eq_ignore_ascii_case(fresh))
+    };
+
+    state.operation == RefundOperation::CloseCreatedSubscription.as_str()
+        && matches!(snapshot.status, 7 | 8)
+        && snapshot.job_type == 1
+        && state.job_id == snapshot.job_id
+        && !is_zero_decimal(&snapshot.original_amount)
+        && has_durable_broadcast_receipt(state)
+        && state.biz_type.is_some_and(|value| value > 0)
+        && state
+            .account_id
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        && state
+            .address
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        && state.chain_index.as_deref() == Some(common::XLAYER_CHAIN_INDEX)
+        && state.job_type == Some(1)
+        && state.user_agent_id == snapshot.buyer_agent_id
+        && state
+            .original_amount
+            .as_deref()
+            .is_some_and(|value| decimal_equal(value, &snapshot.original_amount))
+        && state
+            .token_address
+            .as_deref()
+            .zip(snapshot.token_address.as_deref())
+            .is_some_and(|(expected, actual)| expected.eq_ignore_ascii_case(actual))
+        && optional_ascii_matches(
+            state.token_symbol.as_deref(),
+            snapshot.token_symbol.as_deref(),
+        )
+        && optional_exact_matches(
+            state.provider_agent_id.as_deref(),
+            snapshot.provider_agent_id.as_deref(),
+        )
+        && service_matches
+}
+
+fn apply_confirmed_created_subscription_close(
+    snapshot: &mut RefundSnapshot,
+    state: &PendingRefundMutation,
+) -> bool {
+    if !matches!(state.state.as_str(), "confirmed" | "confirmed_without_hash")
+        || !created_subscription_close_provenance_matches(snapshot, state)
+    {
+        return false;
+    }
+    let (Some(order_id), Some(biz_type), Some(chain_index)) = (
+        state.order_id.clone(),
+        state.biz_type,
+        state.chain_index.clone(),
+    ) else {
+        return false;
+    };
+    snapshot.settlement_confirmed = true;
+    snapshot.settlement_tx_hash = state
+        .tx_hash
+        .as_deref()
+        .filter(|value| valid_tx_hash(value))
+        .map(ToOwned::to_owned);
+    snapshot.settlement_provenance = Some(RefundSettlementProvenance {
+        source: "wallet_order_detail",
+        operation: state.operation.clone(),
+        order_id,
+        biz_type,
+        chain_index,
+        lifecycle_status: snapshot.status,
+    });
     true
 }
 
@@ -664,16 +794,95 @@ fn apply_confirmed_direct_refund(
 async fn reconcile_pending_mutation_locked(
     snapshot: &mut RefundSnapshot,
 ) -> Result<Option<PendingRefundMutation>> {
-    // Expired(8) is already the backend's authoritative terminal result. It
-    // must not read, query, or depend on any local mutation journal, including
-    // stale journals written by releases that exposed timeout finalization.
+    let pending = match read_pending_mutation(&snapshot.job_id, &snapshot.buyer_agent_id) {
+        Ok(pending) => pending,
+        Err(_) if snapshot.status == 8 => {
+            let _ = remove_pending_mutation(&snapshot.job_id, &snapshot.buyer_agent_id);
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    let Some(mut state) = pending else {
+        return Ok(None);
+    };
+
+    if state.operation == RefundOperation::CloseCreatedSubscription.as_str()
+        && matches!(snapshot.status, 7 | 8)
+    {
+        if is_zero_decimal(&snapshot.original_amount) {
+            if state.state != "closed_without_payment" {
+                state.state = "closed_without_payment".to_string();
+                state.updated_at = chrono::Utc::now().timestamp();
+                write_pending_mutation(&state)?;
+            }
+            return Ok(None);
+        }
+
+        // Closed(7) alone does not prove a subscription refund. Expired(8)
+        // normally proves an automatic timeout refund, but when this client
+        // initiated an explicit Created-state close, keep that operation bound
+        // to its exact wallet order before declaring its payment returned.
+        snapshot.settlement_confirmed = false;
+        snapshot.settlement_tx_hash = None;
+        snapshot.settlement_provenance = None;
+        if apply_confirmed_created_subscription_close(snapshot, &state) {
+            return Ok(None);
+        }
+        if matches!(
+            state.state.as_str(),
+            "broadcast_failed" | "lifecycle_advanced_without_receipt" | "provenance_incomplete"
+        ) {
+            return Ok(None);
+        }
+        if !has_durable_broadcast_receipt(&state) {
+            state.state = "lifecycle_advanced_without_receipt".to_string();
+            state.updated_at = chrono::Utc::now().timestamp();
+            write_pending_mutation(&state)?;
+            return Ok(None);
+        }
+        if !created_subscription_close_provenance_matches(snapshot, &state) {
+            state.state = "provenance_incomplete".to_string();
+            state.updated_at = chrono::Utc::now().timestamp();
+            write_pending_mutation(&state)?;
+            return Ok(None);
+        }
+
+        match query_refund_order_status(&state).await {
+            Ok(RefundOrderStatus::Succeeded(tx_hash)) => {
+                state.state = if tx_hash.is_some() {
+                    "confirmed".to_string()
+                } else {
+                    "confirmed_without_hash".to_string()
+                };
+                state.tx_hash = tx_hash;
+                state.updated_at = chrono::Utc::now().timestamp();
+                write_pending_mutation(&state)?;
+                if !apply_confirmed_created_subscription_close(snapshot, &state) {
+                    bail!(
+                        "confirmed Refund V2 order no longer matches its Created subscription close provenance"
+                    );
+                }
+                return Ok(None);
+            }
+            Ok(RefundOrderStatus::Failed) => {
+                state.state = "broadcast_failed".to_string();
+                state.updated_at = chrono::Utc::now().timestamp();
+                write_pending_mutation(&state)?;
+                return Ok(None);
+            }
+            Ok(RefundOrderStatus::Pending | RefundOrderStatus::Unknown) | Err(_) => {
+                return Ok(Some(state));
+            }
+        }
+    }
+
+    // Expired(8) is otherwise already the backend's authoritative terminal
+    // result. It must not depend on stale journals written by releases that
+    // exposed timeout finalization.
     if snapshot.status == 8 {
         let _ = remove_pending_mutation(&snapshot.job_id, &snapshot.buyer_agent_id);
         return Ok(None);
     }
-    let Some(mut state) = read_pending_mutation(&snapshot.job_id, &snapshot.buyer_agent_id)? else {
-        return Ok(None);
-    };
 
     if apply_confirmed_direct_refund(snapshot, &state) {
         return Ok(None);
@@ -1263,6 +1472,7 @@ fn refund_status_label(job_type: i64, status: i64, reason: &str) -> String {
         }
         "expired_without_refundable_payment"
         | "zero_amount_task_closed"
+        | "zero_amount_subscription_closed"
         | "zero_amount_subscription_not_refundable" => {
             return "No refund required".to_string();
         }
@@ -1306,6 +1516,7 @@ fn refund_status_description(job_type: i64, status: i64, reason: &str) -> String
         }
         "expired_without_refundable_payment"
         | "zero_amount_task_closed"
+        | "zero_amount_subscription_closed"
         | "zero_amount_subscription_not_refundable" => {
             return "This task has no refundable payment.".to_string();
         }
@@ -1573,6 +1784,10 @@ impl RefundSnapshot {
     fn settlement_confirmation_source(&self) -> Option<&'static str> {
         if !self.has_confirmed_settlement() {
             None
+        } else if self.settlement_provenance.as_ref().is_some_and(|proof| {
+            proof.operation == RefundOperation::CloseCreatedSubscription.as_str()
+        }) {
+            Some("wallet_order_detail_with_backend_lifecycle")
         } else if self.status != 8 && self.is_subscription() && self.refund_request_provenance {
             Some("backend_onchain_lifecycle_with_local_refund_request")
         } else {
@@ -1606,6 +1821,20 @@ impl RefundSnapshot {
     }
 
     fn plan(&self, reason: Option<&str>) -> Plan {
+        if self.is_subscription() && self.status == 0 {
+            if !is_zero_decimal(&self.original_amount)
+                && !self.has_required_refund_display_details()
+            {
+                return Plan::blocked("refund_task_details_incomplete");
+            }
+            return Plan::executable(
+                "refund_confirmation",
+                "created_subscription_close_confirmation_required",
+                "close_created_subscription",
+                RefundOperation::CloseCreatedSubscription,
+            );
+        }
+
         if self.is_trial() {
             return match self.status {
                 1 if self.auto_renew == Some(1) => Plan::executable(
@@ -1700,7 +1929,7 @@ impl RefundSnapshot {
                 RefundOperation::DirectRefund,
             ),
             0 if !self.is_subscription() => Plan::blocked("direct_refund_funding_not_verified"),
-            0 => Plan::blocked("direct_subscription_refund_contract_required"),
+            0 => Plan::blocked("refund_not_available_for_status"),
             1 if !self.is_subscription() => Plan::blocked("accepted_task_refund_contract_required"),
             1 | 2
                 if (self.is_subscription() && self.status == 1)
@@ -1809,6 +2038,22 @@ impl RefundSnapshot {
                     recommend_stop: true,
                 }
             }
+            7 if self.is_subscription() && self.has_confirmed_settlement() => Plan {
+                phase: "refund_resolution",
+                decision: "ready",
+                reason: "refund_confirmed",
+                operation: None,
+                action_id: None,
+                recommend_stop: true,
+            },
+            7 if self.is_subscription() && is_zero_decimal(&self.original_amount) => Plan {
+                phase: "refund_resolution",
+                decision: "ready",
+                reason: "zero_amount_subscription_closed",
+                operation: None,
+                action_id: None,
+                recommend_stop: true,
+            },
             7 if !self.is_subscription() => Plan {
                 phase: "refund_resolution",
                 decision: "blocked",
@@ -1834,7 +2079,16 @@ impl RefundSnapshot {
     }
 
     fn refund_scope(&self) -> &'static str {
-        if self.is_trial() || is_zero_decimal(&self.original_amount) {
+        let created_subscription_close = self.is_subscription()
+            && (self.status == 0
+                || self.settlement_provenance.as_ref().is_some_and(|proof| {
+                    proof.operation == RefundOperation::CloseCreatedSubscription.as_str()
+                }));
+        if is_zero_decimal(&self.original_amount) {
+            "none"
+        } else if created_subscription_close {
+            "full_subscription_payment"
+        } else if self.is_trial() {
             "none"
         } else if self.is_subscription() {
             "current_subscription_period"
@@ -1849,12 +2103,8 @@ impl RefundSnapshot {
             8 => "not_required",
             9 if self.has_confirmed_settlement() => "confirmed",
             9 => "details_incomplete",
-            7 if !self.is_subscription()
-                && self.payment_mode == Some(1)
-                && self.has_confirmed_settlement() =>
-            {
-                "confirmed"
-            }
+            7 if self.has_confirmed_settlement() => "confirmed",
+            7 if is_zero_decimal(&self.original_amount) => "not_required",
             7 => "details_incomplete",
             6 => "not_refunded",
             3 | 4 => "pending",
@@ -1870,6 +2120,7 @@ impl RefundSnapshot {
             4 => "arbitrating",
             8 => "resolved",
             6 => "resolved",
+            7 if is_zero_decimal(&self.original_amount) => "resolved",
             7 | 9 if self.has_confirmed_settlement() => "resolved",
             7 | 9 => "settlement_unverified",
             _ => "unavailable",
@@ -1946,6 +2197,7 @@ impl RefundSnapshot {
         let refund_flow_verified = matches!(
             plan.reason,
             "direct_refund_confirmation_required"
+                | "created_subscription_close_confirmation_required"
                 | "refund_reason_required"
                 | "refund_reason_too_long"
                 | "refund_request_confirmation_required"
@@ -2642,6 +2894,17 @@ async fn execute_operation(
                 .context("trial conversion cancellation result is unknown")?;
             sign_response(client, &response, account_id, address, snapshot, None, None).await
         }
+        RefundOperation::CloseCreatedSubscription => {
+            let response = client
+                .post_mutation_with_identity(
+                    &format!("{SUBSCRIBE_API_PREFIX}/{}/cancel", snapshot.job_id),
+                    &json!({}),
+                    &snapshot.buyer_agent_id,
+                )
+                .await
+                .context("Created subscription close result is unknown")?;
+            sign_response(client, &response, account_id, address, snapshot, None, None).await
+        }
         RefundOperation::RequestRefund => {
             let reason = reason.ok_or_else(|| anyhow::anyhow!("refund reason is required"))?;
             if snapshot.is_subscription() {
@@ -2998,8 +3261,11 @@ pub async fn handle_execute(
         RefundOperation::CloseZero | RefundOperation::DirectRefund => {
             let _ = super::negotiate::cleanup(job_id);
         }
-        RefundOperation::CancelTrialConversion => {
+        RefundOperation::CancelTrialConversion | RefundOperation::CloseCreatedSubscription => {
             let _ = common::okx_a2a::mark_retired_autotrade_mode_decisions_handled(job_id);
+            if operation == RefundOperation::CloseCreatedSubscription {
+                let _ = super::negotiate::cleanup(job_id);
+            }
         }
         RefundOperation::RequestRefund => {}
     }
@@ -3030,6 +3296,9 @@ pub async fn handle_execute(
         RefundOperation::DirectRefund => "refund_broadcast_submitted",
         RefundOperation::RequestRefund => "refund_request_broadcast_submitted",
         RefundOperation::CancelTrialConversion => "trial_conversion_cancel_broadcast_submitted",
+        RefundOperation::CloseCreatedSubscription => {
+            "created_subscription_close_broadcast_submitted"
+        }
     };
     let mut payload = snapshot.payload(reason, &plan);
     payload["settlement"]["state"] = Value::String("broadcast_submitted".to_string());
@@ -3130,6 +3399,25 @@ mod tests {
         state.operation = "request-refund".to_string();
         state.state = "broadcast_submitted".to_string();
         state.biz_uniq_key = Some(format!("request-{}", snapshot.job_id));
+        state
+    }
+
+    fn confirmed_created_subscription_close(
+        snapshot: &RefundSnapshot,
+        tx_hash: Option<&str>,
+    ) -> PendingRefundMutation {
+        let fallback_hash = format!("0x{}", "ab".repeat(32));
+        let mut state = confirmed_direct_refund(snapshot, tx_hash.unwrap_or(&fallback_hash));
+        state.operation = RefundOperation::CloseCreatedSubscription
+            .as_str()
+            .to_string();
+        state.state = if tx_hash.is_some() {
+            "confirmed".to_string()
+        } else {
+            "confirmed_without_hash".to_string()
+        };
+        state.tx_hash = tx_hash.map(ToOwned::to_owned);
+        state.biz_uniq_key = Some(format!("close-subscription-{}", snapshot.job_id));
         state
     }
 
@@ -3322,11 +3610,35 @@ mod tests {
     }
 
     #[test]
-    fn formal_subscription_created_fails_closed_without_invented_endpoint() {
-        let snapshot = snapshot(json!(1), json!(0), "10");
-        let plan = snapshot.plan(None);
-        assert_eq!(plan.reason, "direct_subscription_refund_contract_required");
-        assert_eq!(plan.operation, None);
+    fn created_subscription_can_close_before_asp_acceptance() {
+        for amount in ["0", "10"] {
+            let snapshot = snapshot(json!(1), json!(0), amount);
+            let plan = snapshot.plan(None);
+            assert_eq!(
+                plan.reason,
+                "created_subscription_close_confirmation_required"
+            );
+            assert_eq!(
+                plan.operation,
+                Some(RefundOperation::CloseCreatedSubscription)
+            );
+            assert_eq!(plan.action_id, Some("close_created_subscription"));
+            assert_eq!(
+                snapshot.refund_scope(),
+                if amount == "0" {
+                    "none"
+                } else {
+                    "full_subscription_payment"
+                }
+            );
+        }
+
+        let mut trial = snapshot(json!(1), json!(0), "0");
+        trial.trial_type = Some(1);
+        assert_eq!(
+            trial.plan(None).operation,
+            Some(RefundOperation::CloseCreatedSubscription)
+        );
     }
 
     #[test]
@@ -3811,6 +4123,93 @@ mod tests {
             &closed,
             &missing_payment_mode
         ));
+    }
+
+    #[test]
+    fn created_subscription_close_requires_terminal_lifecycle_and_wallet_order_proof() {
+        let created = snapshot(json!(1), json!(0), "10");
+        let mut closed = created.clone();
+        closed.status = 7;
+        closed.settlement_confirmed = false;
+        let hash = format!("0x{}", "ab".repeat(32));
+        let proof = confirmed_created_subscription_close(&created, Some(&hash));
+
+        assert!(created_subscription_close_provenance_matches(
+            &closed, &proof
+        ));
+        assert!(apply_confirmed_created_subscription_close(
+            &mut closed,
+            &proof
+        ));
+        assert!(closed.has_confirmed_settlement());
+        assert_eq!(closed.plan(None).reason, "refund_confirmed");
+        assert_eq!(closed.settlement_state(), "confirmed");
+        assert_eq!(closed.refund_scope(), "full_subscription_payment");
+        assert_eq!(
+            closed.settlement_confirmation_source(),
+            Some("wallet_order_detail_with_backend_lifecycle")
+        );
+
+        let mut expired_without_hash = created.clone();
+        expired_without_hash.status = 8;
+        expired_without_hash.settlement_confirmed = false;
+        let proof_without_hash = confirmed_created_subscription_close(&created, None);
+        assert!(apply_confirmed_created_subscription_close(
+            &mut expired_without_hash,
+            &proof_without_hash
+        ));
+        assert!(expired_without_hash.settlement_tx_hash.is_none());
+
+        let mut wrong_amount = proof.clone();
+        wrong_amount.original_amount = Some("11".to_string());
+        assert!(!created_subscription_close_provenance_matches(
+            &closed,
+            &wrong_amount
+        ));
+
+        let mut wrong_job = proof.clone();
+        wrong_job.job_id = "job-2".to_string();
+        assert!(!created_subscription_close_provenance_matches(
+            &closed, &wrong_job
+        ));
+
+        let mut wrong_operation = proof;
+        wrong_operation.operation = RefundOperation::CancelTrialConversion.as_str().to_string();
+        assert!(!created_subscription_close_provenance_matches(
+            &closed,
+            &wrong_operation
+        ));
+    }
+
+    #[test]
+    fn zero_amount_created_subscription_closes_without_refund_settlement() {
+        let mut closed = snapshot(json!(1), json!(7), "0");
+        closed.settlement_confirmed = false;
+        let plan = closed.plan(None);
+        assert_eq!(plan.reason, "zero_amount_subscription_closed");
+        assert_eq!(plan.operation, None);
+        assert_eq!(closed.settlement_state(), "not_required");
+        assert_eq!(closed.refund_state(), "resolved");
+    }
+
+    #[test]
+    fn created_subscription_close_replay_guard_survives_paid_terminal_state() {
+        let created = snapshot(json!(1), json!(0), "10");
+        let pending = confirmed_created_subscription_close(&created, None);
+        assert!(!pending_mutation_resolved(&pending, &created));
+
+        let mut closed = created.clone();
+        closed.status = 7;
+        assert!(!pending_mutation_resolved(&pending, &closed));
+
+        let mut zero_closed = snapshot(json!(1), json!(7), "0");
+        zero_closed.settlement_confirmed = false;
+        let zero_pending = confirmed_created_subscription_close(&zero_closed, None);
+        assert!(pending_mutation_resolved(&zero_pending, &zero_closed));
+
+        let mut accepted = created;
+        accepted.status = 1;
+        assert!(pending_mutation_resolved(&pending, &accepted));
     }
 
     #[test]

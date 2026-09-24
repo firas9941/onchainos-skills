@@ -1104,6 +1104,32 @@ fn enrich_subscription_detail(
             "billingPeriodLabel".to_string(),
             serde_json::Value::String(billing_period_label),
         );
+        // Keep each start/end pair from the same backend range. Falling back
+        // each endpoint independently can combine a current-period start with
+        // the overall subscription end when only half the preferred pair is
+        // present.
+        let current_period_label = [
+            ("periodStartTime", "periodEndTime"),
+            ("subStartTime", "subEndTime"),
+        ]
+        .into_iter()
+        .find_map(|(start_key, end_key)| {
+            let start = obj
+                .get(start_key)
+                .and_then(common::deadline::parse_timestamp_value)?;
+            let end = obj
+                .get(end_key)
+                .and_then(common::deadline::parse_timestamp_value)?;
+            let start = common::deadline::format_utc_timestamp(start)?;
+            let end = common::deadline::format_utc_timestamp(end)?;
+            Some(format!("{start}–{end}"))
+        });
+        obj.insert(
+            "currentPeriodLabel".to_string(),
+            current_period_label
+                .map(serde_json::Value::String)
+                .unwrap_or(serde_json::Value::Null),
+        );
         obj.insert(
             "offlineMessageHandlingLabel".to_string(),
             serde_json::Value::String(
@@ -1137,14 +1163,16 @@ fn enrich_subscription_detail(
                 .map(serde_json::Value::String)
                 .unwrap_or(serde_json::Value::Null),
         );
-        let provider_label = display_facts
-            .provider_name
-            .as_deref()
-            .zip(
-                obj.get("providerAgentId")
-                    .and_then(serde_json::Value::as_str),
-            )
-            .map(|(name, id)| format!("{name} ({id})"));
+        let provider_agent_id = display_string(obj.get("providerAgentId"));
+        let provider_label = match (
+            display_facts.provider_name.as_deref(),
+            provider_agent_id.as_deref(),
+        ) {
+            (Some(name), Some(id)) => Some(format!("{name} ({id})")),
+            (None, Some(id)) => Some(format!("Agent ID {id}")),
+            (Some(name), None) => Some(name.to_string()),
+            (None, None) => None,
+        };
         obj.insert(
             "serviceProviderLabel".to_string(),
             provider_label
@@ -1179,17 +1207,22 @@ fn enrich_subscription_detail(
         );
         let mut missing = Vec::new();
         for (field, key) in [
+            ("Job ID", "jobId"),
+            ("Job Name", "title"),
+            ("Job Description", "description"),
             ("Service Provider", "serviceProviderLabel"),
             ("Free Trial", "freeTrialLabel"),
             ("Fee", "feeLabel"),
+            ("Current Period", "currentPeriodLabel"),
         ] {
-            if obj.get(key).is_none_or(serde_json::Value::is_null) {
+            if display_string(obj.get(key)).is_none() {
                 missing.push(serde_json::Value::String(field.to_string()));
             }
         }
+        let display_ready = display_string(obj.get("jobId")).is_some();
         obj.insert(
             "displayReady".to_string(),
-            serde_json::Value::Bool(missing.is_empty()),
+            serde_json::Value::Bool(display_ready),
         );
         obj.insert(
             "displayMissingFields".to_string(),
@@ -2113,6 +2146,8 @@ mod tests {
         let mut detail = detail_fixture();
         detail["trialType"] = json!(0);
         detail["periodIndex"] = json!(2);
+        detail["periodStartTime"] = json!(1_790_784_000);
+        detail["periodEndTime"] = json!(1_793_376_000);
         detail["autoRenew"] = json!(1);
         detail["offlineReceiveFlag"] = json!(1);
         detail["deviceList"] = json!(["d1"]);
@@ -2131,6 +2166,10 @@ mod tests {
 
         assert_eq!(detail["autoRenewLabel"], "Enabled");
         assert_eq!(detail["billingPeriodLabel"], "Billing Period 2");
+        assert_eq!(
+            detail["currentPeriodLabel"],
+            "2026-09-30 16:00 (UTC+00:00)–2026-10-30 16:00 (UTC+00:00)"
+        );
         assert_eq!(detail["offlineMessageHandlingLabel"], "Clear");
         assert_eq!(detail["receiveOnThisDeviceLabel"], "Receive");
         assert_eq!(detail["serviceProviderLabel"], "Provider (2002)");
@@ -2140,6 +2179,81 @@ mod tests {
             "You have already used the free trial for this service. The subscription fee is charged directly."
         );
         assert_eq!(detail["displayReady"], true);
+    }
+
+    #[test]
+    fn detail_json_remains_displayable_when_optional_labels_are_missing() {
+        let detail = enrich_subscription_detail(
+            detail_fixture(),
+            Some("d1"),
+            true,
+            &SubscriptionDisplayFacts::default(),
+        );
+
+        assert_eq!(detail["displayReady"], true);
+        assert!(detail["displayMissingFields"]
+            .as_array()
+            .is_some_and(|fields| !fields.is_empty()));
+        assert_eq!(detail["title"], "Alpha signals subscription");
+        assert_eq!(detail["serviceProviderLabel"], "Agent ID 2002");
+    }
+
+    #[test]
+    fn detail_json_requires_only_a_non_empty_job_id_to_be_displayable() {
+        let mut detail = detail_fixture();
+        detail["jobId"] = json!("");
+        let detail = enrich_subscription_detail(
+            detail,
+            Some("d1"),
+            true,
+            &SubscriptionDisplayFacts::default(),
+        );
+
+        assert_eq!(detail["displayReady"], false);
+        assert!(detail["displayMissingFields"]
+            .as_array()
+            .is_some_and(|fields| fields.contains(&json!("Job ID"))));
+    }
+
+    #[test]
+    fn detail_json_uses_only_complete_current_period_pairs() {
+        let mut detail = detail_fixture();
+        detail["periodStartTime"] = json!(1_790_784_000);
+        let detail = enrich_subscription_detail(
+            detail,
+            Some("d1"),
+            true,
+            &SubscriptionDisplayFacts::default(),
+        );
+        let expected = format!(
+            "{}–{}",
+            common::deadline::format_utc_timestamp(1_700_600_000).unwrap(),
+            common::deadline::format_utc_timestamp(1_703_192_000).unwrap(),
+        );
+
+        assert_eq!(detail["currentPeriodLabel"], expected);
+        assert!(!detail["currentPeriodLabel"]
+            .as_str()
+            .is_some_and(|label| label.contains("2026-09-30")));
+    }
+
+    #[test]
+    fn detail_json_reports_missing_optional_card_fields() {
+        let mut detail = detail_fixture();
+        detail["description"] = serde_json::Value::Null;
+        detail["subStartTime"] = serde_json::Value::Null;
+        detail["subEndTime"] = serde_json::Value::Null;
+        let detail = enrich_subscription_detail(
+            detail,
+            Some("d1"),
+            true,
+            &SubscriptionDisplayFacts::default(),
+        );
+        let missing = detail["displayMissingFields"].as_array().unwrap();
+
+        assert_eq!(detail["displayReady"], true);
+        assert!(missing.contains(&json!("Job Description")));
+        assert!(missing.contains(&json!("Current Period")));
     }
 
     #[test]

@@ -177,9 +177,10 @@ pub async fn ensure_sufficient_balance(required: f64, currency: &str) -> Result<
                                  {DEPOSIT_QR_MARKER}\n\
                                  2. Swap on XLayer — \"swap <token> to {shortfall} {currency} on xlayer\"\n\
                                  3. Bridge from another chain — \"bridge {shortfall} {currency} from <chain> to xlayer\"\n\
-                                 4. Send from OKX exchange — withdraw {currency} to your wallet address on XLayer network\n\
+                                 4. Send from OKX exchange — withdraw {currency} to your wallet address on XLayer network. \
+                                 The exchange may charge a withdrawal fee\n\
                                  \n\
-                                 Note: gas is paid by the platform paymaster, no OKB / native required."
+                                 Note: on-chain gas on XLayer is free after the funds arrive."
                             );
                             return Err(InsufficientBalanceError::new(
                                 message, currency, required, balance,
@@ -201,9 +202,10 @@ pub async fn ensure_sufficient_balance(required: f64, currency: &str) -> Result<
          {DEPOSIT_QR_MARKER}\n\
          2. Swap on XLayer — \"swap <token> to {required} {currency} on xlayer\"\n\
          3. Bridge from another chain — \"bridge {required} {currency} from <chain> to xlayer\"\n\
-         4. Send from OKX exchange — withdraw {currency} to your wallet address on XLayer network\n\
+         4. Send from OKX exchange — withdraw {currency} to your wallet address on XLayer network. \
+         The exchange may charge a withdrawal fee\n\
          \n\
-         Note: gas is paid by the platform paymaster, no OKB / native required."
+         Note: on-chain gas on XLayer is free after the funds arrive."
     );
     Err(InsufficientBalanceError::new(message, currency, required, 0.0).into())
 }
@@ -320,9 +322,10 @@ pub async fn ensure_sufficient_balance_at(
                      {DEPOSIT_QR_MARKER}\n\
                      2. Swap on XLayer — \"swap <token> to {shortfall} {currency} on xlayer\"\n\
                      3. Bridge from another chain — \"bridge {shortfall} {currency} from <chain> to xlayer\"\n\
-                     4. Send from OKX exchange — withdraw {currency} to your wallet address on XLayer network\n\
+                     4. Send from OKX exchange — withdraw {currency} to your wallet address on XLayer network. \
+                     The exchange may charge a withdrawal fee\n\
                      \n\
-                     Note: gas is paid by the platform paymaster, no OKB / native required."
+                     Note: on-chain gas on XLayer is free after the funds arrive."
                 );
                 return Err(
                     InsufficientBalanceError::new(message, currency, required, balance).into(),
@@ -340,9 +343,10 @@ pub async fn ensure_sufficient_balance_at(
          {DEPOSIT_QR_MARKER}\n\
          2. Swap on XLayer — \"swap <token> to {required} {currency} on xlayer\"\n\
          3. Bridge from another chain — \"bridge {required} {currency} from <chain> to xlayer\"\n\
-         4. Send from OKX exchange — withdraw {currency} to your wallet address on XLayer network\n\
+         4. Send from OKX exchange — withdraw {currency} to your wallet address on XLayer network. \
+         The exchange may charge a withdrawal fee\n\
          \n\
-         Note: gas is paid by the platform paymaster, no OKB / native required."
+         Note: on-chain gas on XLayer is free after the funds arrive."
     );
     Err(InsufficientBalanceError::new(message, currency, required, 0.0).into())
 }
