@@ -10,6 +10,7 @@
 
 use anyhow::{bail, Result};
 use serde_json::{json, Value};
+use std::collections::HashSet;
 
 use super::network::task_api_client::TaskApiClient;
 use super::DEBUG_LOG;
@@ -157,6 +158,28 @@ pub async fn fetch_task_detail(
         .await
 }
 
+fn integer_field(value: &Value, key: &str) -> Option<i64> {
+    value.get(key).and_then(|field| {
+        field
+            .as_i64()
+            .or_else(|| field.as_str()?.trim().parse().ok())
+    })
+}
+
+fn status_code_for_task_type(
+    job_type: Option<i64>,
+    task_detail: &Value,
+    subscription_detail: Option<&Value>,
+) -> Option<i64> {
+    match job_type {
+        Some(0) => integer_field(task_detail, "status"),
+        Some(1) => subscription_detail.and_then(|detail| {
+            integer_field(detail, "subStatus").or_else(|| integer_field(detail, "status"))
+        }),
+        _ => None,
+    }
+}
+
 /// Query task status.
 pub async fn handle_status(
     client: &mut TaskApiClient,
@@ -188,7 +211,20 @@ pub async fn handle_status(
             return Ok(());
         }
     };
-    let status_code = resp["status"].as_i64();
+    let job_type = integer_field(&resp, "jobType");
+    // The ordinary task record is only the type gate for subscriptions. Its
+    // status projection may lag behind the subscription lifecycle, so never
+    // use it as the authoritative subscription status.
+    let subscription_detail = if job_type == Some(1) {
+        client
+            .fetch_subscription(job_id, &resolved_agent_id)
+            .await
+            .ok()
+    } else {
+        None
+    };
+    let status_code = status_code_for_task_type(job_type, &resp, subscription_detail.as_ref());
+    let status_detail = subscription_detail.as_ref().unwrap_or(&resp);
     let dispute = match status_code {
         Some(4) => Some(
             crate::commands::agent_commerce::task::evaluator::dispute_status::get_dispute_status(
@@ -210,20 +246,29 @@ pub async fn handle_status(
         _ => None,
     };
     if let Some(dispute) = dispute.as_ref() {
-        emit_arbitration_status(job_id, &resp, dispute);
+        emit_arbitration_status(job_id, status_detail, dispute);
     } else {
         let t = &resp;
         let token_sym = t["tokenSymbol"].as_str().unwrap_or("?");
-        let code = t["status"].as_i64();
-        println!(
-            "Task status: {}",
-            code.map(task_status_label).unwrap_or("Status unavailable")
-        );
-        println!(
-            "Status detail: {}",
-            code.map(task_status_description)
-                .unwrap_or("The task status is currently unavailable.")
-        );
+        let code = status_code;
+        println!("Task type: {}", task_type_name(job_type));
+        let user_close_submitted = job_type == Some(1)
+            && crate::commands::agent_commerce::task::user::refund::has_created_subscription_close_receipt(
+                job_id,
+                &resolved_agent_id,
+            );
+        let (status_label, status_description) = code
+            .map(|status| {
+                status_copy_for_task_type(job_type, status, status_detail, user_close_submitted)
+            })
+            .unwrap_or_else(|| {
+                (
+                    "Status unavailable".to_string(),
+                    "The task status is currently unavailable.".to_string(),
+                )
+            });
+        println!("Task status: {status_label}");
+        println!("Status detail: {status_description}");
         println!("  jobId:    {job_id}");
         println!("  title:    {}", t["title"].as_str().unwrap_or("?"));
         println!(
@@ -360,6 +405,84 @@ pub fn task_status_description(code: i64) -> &'static str {
     }
 }
 
+fn task_type_name(job_type: Option<i64>) -> &'static str {
+    match job_type {
+        Some(0) => "one_time",
+        Some(1) => "subscription",
+        _ => "unknown",
+    }
+}
+
+fn subscription_status_name(code: i64) -> &'static str {
+    match code {
+        -1 => "init",
+        0 => "created",
+        1 => "active",
+        3 => "rejected",
+        4 => "disputed",
+        6 => "completed",
+        7 => "closed",
+        8 => "expired",
+        9 => "failed",
+        _ => "unknown",
+    }
+}
+
+fn subscription_status_label(code: i64) -> &'static str {
+    match code {
+        -1 => "Initializing",
+        0 => "Awaiting ASP acceptance",
+        1 => "Active",
+        3 => "Awaiting ASP decision",
+        4 => "Evaluation in progress",
+        6 => "Completed",
+        7 => "Closed",
+        8 => "Expired",
+        9 => "Subscription result needs reconciliation",
+        _ => "Status unavailable",
+    }
+}
+
+fn subscription_status_description(code: i64) -> &'static str {
+    match code {
+        -1 => "The subscription is being initialized.",
+        0 => "The subscription is waiting for an ASP to accept it.",
+        1 => "The subscription is active.",
+        3 => "The buyer rejected the current delivery and is waiting for the ASP's decision.",
+        4 => "The subscription refund request is in Evaluation.",
+        6 => "The subscription completed without a refund.",
+        7 => "The subscription is closed.",
+        8 => "The subscription expired.",
+        9 => "The subscription result requires settlement reconciliation.",
+        _ => "The subscription status is currently unavailable.",
+    }
+}
+
+fn status_copy_for_task_type(
+    job_type: Option<i64>,
+    code: i64,
+    detail: &Value,
+    user_close_submitted: bool,
+) -> (String, String) {
+    match job_type {
+        Some(0) => (
+            task_status_label(code).to_string(),
+            task_status_description(code).to_string(),
+        ),
+        Some(1) if matches!(code, 8 | 9) => {
+            super::lifecycle::subscription_status_copy(detail, user_close_submitted)
+        }
+        Some(1) => (
+            subscription_status_label(code).to_string(),
+            subscription_status_description(code).to_string(),
+        ),
+        _ => (
+            "Status unavailable".to_string(),
+            "The task type is unknown, so its status cannot be interpreted safely.".to_string(),
+        ),
+    }
+}
+
 fn role_name(code: i64) -> &'static str {
     match code {
         1 => "user",
@@ -369,10 +492,13 @@ fn role_name(code: i64) -> &'static str {
     }
 }
 
-/// Actionable/non-terminal statuses. Expired(8) is terminal because the
-/// backend projects it only after any applicable automatic refund completes.
-fn is_non_terminal_for_role(code: i64, _role: i64) -> bool {
-    matches!(code, 0..=4)
+/// Actionable/non-terminal statuses for each task lifecycle. Expired(8) is
+/// terminal because the backend projects it only after applicable settlement.
+fn is_non_terminal(kind: ActiveTaskKind, code: i64) -> bool {
+    match kind {
+        ActiveTaskKind::OneTime => matches!(code, 0..=4),
+        ActiveTaskKind::Subscription => matches!(code, -1 | 0 | 1 | 3 | 4),
+    }
 }
 
 fn short_job_id(jid: &str) -> String {
@@ -391,8 +517,124 @@ fn parse_role_arg(raw: &str) -> Option<i64> {
     }
 }
 
-/// Aggregated non-terminal task list across all agents under the current active
-/// account. Designed for the user-session "ad-hoc instruction → sub session"
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ActiveTaskKind {
+    OneTime,
+    Subscription,
+}
+
+fn ordinary_task_kind(task: &Value) -> Option<ActiveTaskKind> {
+    match integer_field(task, "jobType") {
+        Some(1) => None,
+        Some(0) | None => Some(ActiveTaskKind::OneTime),
+        Some(_) => None,
+    }
+}
+
+fn string_field_from_keys<'a>(value: &'a Value, keys: &[&str]) -> &'a str {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(Value::as_str))
+        .unwrap_or("")
+}
+
+fn list_items(value: &Value) -> Vec<Value> {
+    value
+        .get("list")
+        .and_then(Value::as_array)
+        .or_else(|| value.as_array())
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn active_task_row(
+    task: &Value,
+    kind: ActiveTaskKind,
+    agent_id: &str,
+    role: i64,
+    include_terminal: bool,
+) -> Option<Value> {
+    let status_code = match kind {
+        ActiveTaskKind::OneTime => integer_field(task, "status"),
+        ActiveTaskKind::Subscription => {
+            integer_field(task, "subStatus").or_else(|| integer_field(task, "status"))
+        }
+    }?;
+    if !include_terminal && !is_non_terminal(kind, status_code) {
+        return None;
+    }
+
+    let job_id = string_field_from_keys(task, &["jobId", "subId"]);
+    if job_id.is_empty() {
+        return None;
+    }
+    let user_id = string_field_from_keys(task, &["buyerAgentId", "userAgentId"]);
+    let provider_id = string_field_from_keys(task, &["providerAgentId", "aspAgentId"]);
+    let (counterparty_id, counterparty_role) = match role {
+        1 => (provider_id, "asp"),
+        2 => (user_id, "user"),
+        _ => ("", ""),
+    };
+    let user_close_submitted = matches!(kind, ActiveTaskKind::Subscription)
+        && crate::commands::agent_commerce::task::user::refund::has_created_subscription_close_receipt(
+            job_id,
+            agent_id,
+        );
+    let (task_type, status, status_label, status_description) = match kind {
+        ActiveTaskKind::OneTime => (
+            "one_time",
+            status_name(status_code),
+            task_status_label(status_code).to_string(),
+            task_status_description(status_code).to_string(),
+        ),
+        ActiveTaskKind::Subscription => {
+            let (label, description) =
+                status_copy_for_task_type(Some(1), status_code, task, user_close_submitted);
+            (
+                "subscription",
+                subscription_status_name(status_code),
+                label,
+                description,
+            )
+        }
+    };
+
+    Some(json!({
+        "jobId": job_id,
+        "shortJobId": short_job_id(job_id),
+        "taskType": task_type,
+        "status": status,
+        "statusLabel": status_label,
+        "statusDescription": status_description,
+        "statusCode": status_code,
+        "title": string_field_from_keys(task, &["title", "jobName", "serviceName"]),
+        "tokenAmount": string_field_from_keys(task, &["serviceTokenAmount", "paymentTokenAmount", "tokenAmount"]),
+        "tokenSymbol": string_field_from_keys(task, &["serviceTokenSymbol", "paymentTokenSymbol", "tokenSymbol"]),
+        "myAgentId": agent_id,
+        "myRole": role_name(role),
+        "counterpartyAgentId": if counterparty_id.is_empty() {
+            Value::Null
+        } else {
+            Value::String(counterparty_id.to_string())
+        },
+        "counterpartyRole": if counterparty_role.is_empty() {
+            Value::Null
+        } else {
+            Value::String(counterparty_role.to_string())
+        },
+    }))
+}
+
+fn push_unique_active_task(rows: &mut Vec<Value>, seen: &mut HashSet<String>, row: Value) {
+    let agent_id = row.get("myAgentId").and_then(Value::as_str).unwrap_or("");
+    let job_id = row.get("jobId").and_then(Value::as_str).unwrap_or("");
+    if seen.insert(format!("{agent_id}\0{job_id}")) {
+        rows.push(row);
+    }
+}
+
+/// Aggregated non-terminal one-time and subscription task list across all
+/// agents under the current active account. Designed for the user-session
+/// "ad-hoc instruction → sub session"
 /// routing flow:
 ///
 ///   1. user-session calls `agent active-tasks` (this command)
@@ -411,6 +653,7 @@ fn parse_role_arg(raw: &str) -> Option<i64> {
 ///     {
 ///       "jobId":               "0xabc...",
 ///       "shortJobId":          "0xabc…1234",
+///       "taskType":            "one_time",
 ///       "status":              "accepted",
 ///       "statusCode":          1,
 ///       "title":               "小猫图片",
@@ -442,8 +685,11 @@ pub async fn handle_active_tasks(
         agents.retain(|a| a.get("role").and_then(|v| v.as_i64()) == Some(want));
     }
 
-    // 2. For each agent, query `task/my` and aggregate.
+    // 2. For each agent, query both task registries and aggregate. Subscription
+    // rows are inserted first so their authoritative lifecycle wins if an old
+    // task projection exposes the same Job ID.
     let mut all_tasks: Vec<Value> = Vec::new();
+    let mut seen_tasks = HashSet::new();
     for agent in &agents {
         let agent_id = agent.get("agentId").and_then(|v| v.as_str()).unwrap_or("");
         let role = agent.get("role").and_then(|v| v.as_i64()).unwrap_or(0);
@@ -451,65 +697,57 @@ pub async fn handle_active_tasks(
             continue;
         }
 
+        if matches!(role, 1 | 2) {
+            let status_types: &[u8] = if include_terminal { &[1, 2] } else { &[1] };
+            for status_type in status_types {
+                let path = format!(
+                    "/priapi/v1/aieco/task/subscribe/my?page=1&pageSize=100&statusType={status_type}"
+                );
+                let response = match client.get_with_identity(&path, agent_id).await {
+                    Ok(response) => response,
+                    Err(error) => {
+                        if DEBUG_LOG {
+                            eprintln!(
+                                "[active-tasks] agent {agent_id} subscription query failed: {error}"
+                            );
+                        }
+                        continue;
+                    }
+                };
+                for task in list_items(&response) {
+                    if let Some(row) = active_task_row(
+                        &task,
+                        ActiveTaskKind::Subscription,
+                        agent_id,
+                        role,
+                        include_terminal,
+                    ) {
+                        push_unique_active_task(&mut all_tasks, &mut seen_tasks, row);
+                    }
+                }
+            }
+        }
+
         let path = "/priapi/v1/aieco/task/my?page=1&page_size=100";
-        let resp = match client.get_with_identity(path, agent_id).await {
-            Ok(r) => r,
-            Err(e) => {
+        let response = match client.get_with_identity(path, agent_id).await {
+            Ok(response) => response,
+            Err(error) => {
                 if DEBUG_LOG {
-                    eprintln!("[active-tasks] agent {agent_id} query failed: {e}");
+                    eprintln!("[active-tasks] agent {agent_id} task query failed: {error}");
                 }
                 continue;
             }
         };
-
-        let tasks = resp["list"].as_array().cloned().unwrap_or_default();
-        for t in tasks {
-            let status_code = t.get("status").and_then(|v| v.as_i64()).unwrap_or(-1);
-            if !include_terminal && !is_non_terminal_for_role(status_code, role) {
+        for task in list_items(&response) {
+            // `/task/my` may retain a stale projection for subscription jobs.
+            // Those rows are owned by `/subscribe/my`; treating them as
+            // one-time tasks can resurrect a terminal subscription as active.
+            let Some(kind) = ordinary_task_kind(&task) else {
                 continue;
-            }
-
-            let user_id = t.get("buyerAgentId").and_then(|v| v.as_str()).unwrap_or("");
-            let provider_id = t
-                .get("providerAgentId")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-
-            // Counterparty inferred from my role:
-            // - I'm user (1) → counterparty is asp
-            // - I'm asp (2) → counterparty is user
-            // - I'm evaluator (3) → no single counterparty (both user + asp are parties)
-            let (counterparty_id, counterparty_role) = match role {
-                1 => (provider_id, "asp"),
-                2 => (user_id, "user"),
-                _ => ("", ""),
             };
-
-            let job_id = t.get("jobId").and_then(|v| v.as_str()).unwrap_or("");
-
-            all_tasks.push(json!({
-                "jobId":               job_id,
-                "shortJobId":          short_job_id(job_id),
-                "status":               status_name(status_code),
-                "statusLabel":          task_status_label(status_code),
-                "statusDescription":    task_status_description(status_code),
-                "statusCode":           status_code,
-                "title":                t.get("title").and_then(|v| v.as_str()).unwrap_or(""),
-                "tokenAmount":          t.get("tokenAmount").and_then(|v| v.as_str()).unwrap_or(""),
-                "tokenSymbol":          t.get("tokenSymbol").and_then(|v| v.as_str()).unwrap_or(""),
-                "myAgentId":            agent_id,
-                "myRole":               role_name(role),
-                "counterpartyAgentId":  if counterparty_id.is_empty() {
-                                            Value::Null
-                                        } else {
-                                            Value::String(counterparty_id.to_string())
-                                        },
-                "counterpartyRole":     if counterparty_role.is_empty() {
-                                            Value::Null
-                                        } else {
-                                            Value::String(counterparty_role.to_string())
-                                        },
-            }));
+            if let Some(row) = active_task_row(&task, kind, agent_id, role, include_terminal) {
+                push_unique_active_task(&mut all_tasks, &mut seen_tasks, row);
+            }
         }
     }
 
@@ -635,6 +873,92 @@ mod tests {
         );
     }
 
+    #[test]
+    fn status_output_is_routed_by_task_type() {
+        assert_eq!(task_type_name(Some(0)), "one_time");
+        assert_eq!(task_type_name(Some(1)), "subscription");
+        assert_eq!(task_type_name(None), "unknown");
+
+        let detail = json!({"status": 1});
+        assert_eq!(
+            status_copy_for_task_type(Some(0), 1, &detail, false).0,
+            "In progress"
+        );
+        assert_eq!(
+            status_copy_for_task_type(Some(1), 1, &detail, false).0,
+            "Active"
+        );
+        assert_eq!(
+            status_copy_for_task_type(None, 1, &detail, false).0,
+            "Status unavailable"
+        );
+        assert_eq!(
+            status_copy_for_task_type(Some(1), 1, &detail, false).1,
+            "The subscription is active."
+        );
+        assert_eq!(
+            status_copy_for_task_type(None, 1, &detail, false).1,
+            "The task type is unknown, so its status cannot be interpreted safely."
+        );
+    }
+
+    #[test]
+    fn subscription_status_comes_from_subscription_detail() {
+        let task_detail = json!({"jobType": 1, "status": 1});
+        let subscription_detail = json!({"subStatus": 7});
+
+        assert_eq!(
+            status_code_for_task_type(Some(1), &task_detail, Some(&subscription_detail)),
+            Some(7)
+        );
+        assert_eq!(
+            status_copy_for_task_type(
+                Some(1),
+                status_code_for_task_type(Some(1), &task_detail, Some(&subscription_detail))
+                    .unwrap(),
+                &subscription_detail,
+                false,
+            )
+            .0,
+            "Closed"
+        );
+    }
+
+    #[test]
+    fn subscription_failed_status_uses_settlement_facts() {
+        let refunded = json!({
+            "status": 9,
+            "trialType": 0,
+            "paymentTokenAmount": "10",
+            "paymentTokenSymbol": "USDT"
+        });
+        let trial_failure = json!({"status": 9, "trialType": 1});
+        let unverified = json!({"status": 9});
+
+        assert_eq!(
+            status_copy_for_task_type(Some(1), 9, &refunded, false).0,
+            "Refund completed; task closed"
+        );
+        assert_eq!(
+            status_copy_for_task_type(Some(1), 9, &trial_failure, false).0,
+            "Paid subscription did not start; task closed"
+        );
+        assert_eq!(
+            status_copy_for_task_type(Some(1), 9, &unverified, false).0,
+            "Subscription result needs reconciliation"
+        );
+    }
+
+    #[test]
+    fn subscription_status_fails_closed_when_subscription_detail_is_missing() {
+        let stale_task_detail = json!({"jobType": 1, "status": 1});
+
+        assert_eq!(
+            status_code_for_task_type(Some(1), &stale_task_detail, None),
+            None
+        );
+    }
+
     // ─── R1 verbatim passthrough (no identity lookup) ────────────────────
     // An explicit --agent-id returns before any await on role/list lookup, so
     // this is deterministic and network-free.
@@ -670,22 +994,116 @@ mod tests {
     }
 
     #[test]
-    fn active_task_filter_excludes_expired_for_every_role() {
-        for role in [1, 2, 3] {
-            for status in [0, 1, 2, 3, 4] {
-                assert!(
-                    is_non_terminal_for_role(status, role),
-                    "status {status} must stay visible for role {role}"
-                );
-            }
+    fn active_task_filter_uses_task_specific_status_sets() {
+        for status in [0, 1, 2, 3, 4] {
+            assert!(
+                is_non_terminal(ActiveTaskKind::OneTime, status),
+                "one-time status {status} must stay visible"
+            );
         }
-        for role in [1, 2, 3] {
+        for status in [-1, 0, 1, 3, 4] {
+            assert!(
+                is_non_terminal(ActiveTaskKind::Subscription, status),
+                "subscription status {status} must stay visible"
+            );
+        }
+        assert!(!is_non_terminal(ActiveTaskKind::Subscription, 2));
+        for kind in [ActiveTaskKind::OneTime, ActiveTaskKind::Subscription] {
             for status in [5, 6, 7, 8, 9] {
-                assert!(
-                    !is_non_terminal_for_role(status, role),
-                    "status {status} must be terminal for role {role}"
-                );
+                assert!(!is_non_terminal(kind, status));
             }
         }
+    }
+
+    #[test]
+    fn ordinary_task_projection_excludes_subscription_rows() {
+        assert_eq!(
+            ordinary_task_kind(&json!({"jobType": 0})),
+            Some(ActiveTaskKind::OneTime)
+        );
+        assert_eq!(ordinary_task_kind(&json!({"jobType": 1})), None);
+        assert_eq!(ordinary_task_kind(&json!({"jobType": "1"})), None);
+        assert_eq!(
+            ordinary_task_kind(&json!({"status": 1})),
+            Some(ActiveTaskKind::OneTime)
+        );
+        assert_eq!(ordinary_task_kind(&json!({"jobType": 99})), None);
+    }
+
+    #[test]
+    fn active_task_rows_distinguish_one_time_and_subscription_statuses() {
+        let one_time = active_task_row(
+            &json!({
+                "jobId": "task-1",
+                "status": 1,
+                "title": "One-time analysis",
+                "buyerAgentId": "buyer-1",
+                "providerAgentId": "asp-1"
+            }),
+            ActiveTaskKind::OneTime,
+            "asp-1",
+            2,
+            false,
+        )
+        .unwrap();
+        let subscription = active_task_row(
+            &json!({
+                "jobId": "subscription-1",
+                "subStatus": "1",
+                "serviceName": "Daily signals",
+                "buyerAgentId": "buyer-1",
+                "providerAgentId": "asp-1"
+            }),
+            ActiveTaskKind::Subscription,
+            "asp-1",
+            2,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(one_time["taskType"], "one_time");
+        assert_eq!(one_time["statusLabel"], "In progress");
+        assert_eq!(subscription["taskType"], "subscription");
+        assert_eq!(subscription["statusLabel"], "Active");
+    }
+
+    #[test]
+    fn active_task_rows_filter_terminal_subscriptions() {
+        let closed = json!({"jobId": "subscription-1", "status": 7});
+        assert!(
+            active_task_row(&closed, ActiveTaskKind::Subscription, "buyer-1", 1, false).is_none()
+        );
+        assert!(
+            active_task_row(&closed, ActiveTaskKind::Subscription, "buyer-1", 1, true).is_some()
+        );
+    }
+
+    #[test]
+    fn subscription_row_wins_when_task_projection_has_the_same_job_id() {
+        let mut rows = Vec::new();
+        let mut seen = HashSet::new();
+        let subscription = active_task_row(
+            &json!({"jobId": "same-job", "status": 7}),
+            ActiveTaskKind::Subscription,
+            "buyer-1",
+            1,
+            true,
+        )
+        .unwrap();
+        let stale_task = active_task_row(
+            &json!({"jobId": "same-job", "status": 1}),
+            ActiveTaskKind::OneTime,
+            "buyer-1",
+            1,
+            true,
+        )
+        .unwrap();
+
+        push_unique_active_task(&mut rows, &mut seen, subscription);
+        push_unique_active_task(&mut rows, &mut seen, stale_task);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["taskType"], "subscription");
+        assert_eq!(rows[0]["statusLabel"], "Closed");
     }
 }

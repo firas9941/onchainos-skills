@@ -364,7 +364,7 @@ pub enum AgentCommand {
         agent_id: Option<String>,
     },
 
-    /// Reconstruct a task's lifecycle from authoritative status and local XMTP history
+    /// Reconstruct a one-time task or subscription lifecycle from authoritative status and local XMTP history
     Lifecycle {
         job_id: String,
         #[arg(long = "agent-id")]
@@ -483,13 +483,10 @@ pub enum AgentCommand {
         visibility: task::user::visibility::TaskVisibility,
     },
 
-    /// Aggregated non-terminal tasks across **all agents under the current
-    /// active account**, with `myRole` / `counterpartyAgentId` annotations so
-    /// the user-session can route ad-hoc user instructions to the correct sub
-    /// session (via `okx-a2a session query` → `okx-a2a session send --no-wait`).
-    /// Status filter: includes 0 created / 1 accepted / 2 submitted / 3 refused
-    /// / 4 disputed by default. Pass `--include-terminal` to include terminal
-    /// rows, including 8 expired.
+    /// Aggregated non-terminal one-time and subscription tasks across **all
+    /// agents under the current active account**, with task type, role, and
+    /// counterparty annotations. Pass `--include-terminal` to include ended
+    /// tasks and subscriptions.
     #[command(name = "active-tasks")]
     ActiveTasks {
         /// Optional role filter: user | asp | evaluator

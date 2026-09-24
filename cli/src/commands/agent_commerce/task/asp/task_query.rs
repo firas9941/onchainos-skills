@@ -96,11 +96,7 @@ fn status_fields(kind: TaskKind, code: i64) -> (&'static str, String, &'static s
                 9 => "FAILED",
                 _ => "UNKNOWN",
             },
-            match code {
-                0 => "Awaiting acceptance".to_string(),
-                1 => "In service".to_string(),
-                _ => subscription_ops::status_label(code).to_string(),
-            },
+            subscription_ops::status_label(code).to_string(),
             subscription_ops::status_description(code),
         ),
     }
@@ -621,6 +617,7 @@ mod tests {
         assert_eq!(items[0]["taskTypeLabel"], "Subscription Task");
         assert_eq!(items[0]["testFlag"], true);
         assert_eq!(items[0]["feeLabel"], "10 USDT / month");
+        assert_eq!(items[0]["statusLabel"], "Active");
         assert_eq!(items[0]["billingPeriodLabel"], "Billing Period 2");
         assert_eq!(items[0]["autoRenewLabel"], "Enabled");
         assert!(items[0]["nextChargeAt"].is_string());
@@ -805,6 +802,7 @@ mod tests {
         assert_eq!(task["userName"], "Alice");
         assert_eq!(task["userAgentId"], "5678");
         assert_eq!(task["testFlag"], true);
+        assert_eq!(task["statusLabel"], "Active");
         assert_eq!(task["billingCycleLabel"], "Monthly");
         assert_eq!(task["currentPeriod"], expected_period);
         assert_ne!(task["currentPeriod"], subscription_window);
